@@ -192,7 +192,6 @@ class DerivClient:
             "end": "latest",
             "start": 1,
             "style": "candles",
-            "subscribe": 0,
             "granularity": granularity,
         })
         raw = resp.get("candles", [])
