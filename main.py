@@ -607,13 +607,16 @@ async def check_model1(client: DerivClient, symbol: str) -> Optional[dict]:
     """Model 1: Daily CRT Continuation (spec 3.1)."""
     now = datetime.now(timezone.utc)
     if not (MODEL1_WINDOW_UTC_HOURS[0] <= now.hour < MODEL1_WINDOW_UTC_HOURS[1]):
-        return None
+        return None  # outside the 16:00-24:00 UTC evaluation window — logged once at debug level is noisy, skip
     d1 = await client.get_candles(symbol, GRAN["D1"], count=10, drop_forming=False)
     if len(d1) < 2:
+        log.debug("[%s] Model1: not enough D1 candles", symbol)
         return None
     candle1, candle2 = d1[-2], d1[-1]
     direction = two_candle_bos(candle1, candle2)
     if direction is None:
+        log.info("[%s] Model1: no 2-candle D1 BOS (c1 H/L=%.5f/%.5f, c2 H/L=%.5f/%.5f)",
+                  symbol, candle1.high, candle1.low, candle2.high, candle2.low)
         return None
 
     h4 = await client.get_candles(symbol, GRAN["H4"])
@@ -622,10 +625,17 @@ async def check_model1(client: DerivClient, symbol: str) -> Optional[dict]:
     flows = {"H4": compute_orderflow(h4), "H2": compute_orderflow(h2), "H1": compute_orderflow(h1)}
     agree = sum(1 for f in flows.values() if f == direction)
     if agree < 2:
+        log.info("[%s] Model1: D1 BOS=%s but only %d/3 LTFs agree (H4=%s H2=%s H1=%s) — invalidated",
+                  symbol, direction, agree, flows["H4"], flows["H2"], flows["H1"])
         return {"verdict": "invalidated", "model": "daily_crt"}
 
     pois = [p for p in gather_pois(h4, "H4") + gather_pois(h2, "H2") + gather_pois(h1, "H1")
             if p["direction"] == direction]
+    if not pois:
+        log.info("[%s] Model1: D1 BOS=%s, LTFs agree (%d/3), but no matching unmitigated POI found",
+                  symbol, direction, agree)
+    else:
+        log.info("[%s] Model1: CONFIRMED %s bias, %d matching POI(s) found", symbol, direction, len(pois))
     invalidation = candle2.low if direction == "bullish" else candle2.high
     return {"verdict": direction, "model": "daily_crt", "symbol": symbol,
             "bos_candle1": candle1, "bos_candle2": candle2, "ltf_flows": flows,
@@ -640,21 +650,31 @@ async def check_model2(client: DerivClient, symbol: str) -> Optional[dict]:
         return None
     h4 = await client.get_candles(symbol, GRAN["H4"], count=10, drop_forming=False)
     if len(h4) < 2:
+        log.debug("[%s] Model2: not enough H4 candles", symbol)
         return None
     candle1, candle2 = h4[-2], h4[-1]
     direction = two_candle_bos(candle1, candle2)
     if direction is None:
+        log.info("[%s] Model2: no 2-candle H4 BOS (c1 H/L=%.5f/%.5f, c2 H/L=%.5f/%.5f)",
+                  symbol, candle1.high, candle1.low, candle2.high, candle2.low)
         return None
 
     m30 = await client.get_candles(symbol, GRAN["M30"])
     m15 = await client.get_candles(symbol, GRAN["M15"])
     flow30, flow15 = compute_orderflow(m30), compute_orderflow(m15)
     if not (flow30 == direction and flow15 == direction):
+        log.info("[%s] Model2: H4 BOS=%s but M30=%s/M15=%s don't both agree — invalidated",
+                  symbol, direction, flow30, flow15)
         return {"verdict": "invalidated", "model": "4h_crt"}
 
     pois30 = [p for p in gather_pois(m30, "M30") if p["direction"] == direction]
     pois15 = [p for p in gather_pois(m15, "M15") if p["direction"] == direction]
     merged = merge_confluence(pois30, pois15)
+    if not merged:
+        log.info("[%s] Model2: H4 BOS=%s, M30/M15 agree, but no matching unmitigated POI found",
+                  symbol, direction)
+    else:
+        log.info("[%s] Model2: CONFIRMED %s bias, %d matching POI(s) found", symbol, direction, len(merged))
     invalidation = candle2.low if direction == "bullish" else candle2.high
     return {"verdict": direction, "model": "4h_crt", "symbol": symbol,
             "bos_candle1": candle1, "bos_candle2": candle2,
