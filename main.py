@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # public data, no app_id/auth needed
+DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # public data, no app_id/auth needed
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
@@ -144,7 +144,13 @@ class DerivClient:
         self._req_id = 0
 
     async def connect(self):
-        self.ws = await websockets.connect(self.url, ping_interval=20, ping_timeout=10)
+        # ping_interval=None disables the low-level WebSocket protocol ping/pong.
+        # Deriv's current public endpoint does not appear to answer that protocol-level
+        # ping, which was causing a disconnect roughly every 30s (20s wait + 10s
+        # timeout) regardless of actual connection health. Deriv's own documented
+        # keepalive is the application-level {"ping": 1} API call instead — see
+        # DerivClient.keepalive(), called once per poll cycle in AlertEngine._poll_loop.
+        self.ws = await websockets.connect(self.url, ping_interval=None)
         log.info("Connected to Deriv WebSocket")
 
     def _next_id(self) -> int:
@@ -182,6 +188,12 @@ class DerivClient:
                 continue
             log.warning("Could not resolve symbol for '%s' — skipping.", name)
         log.info("Resolved %d/%d target assets to live symbols", len(self.symbol_map), len(display_names))
+
+    async def keepalive(self):
+        """Deriv's documented application-level keepalive — a plain {"ping": 1}
+        request. Called once per poll cycle instead of relying on the low-level
+        WebSocket protocol ping, which this endpoint does not appear to answer."""
+        await self._send_recv({"ping": 1}, timeout=10)
 
     async def get_candles(self, symbol: str, granularity: int, count: int = 300,
                            drop_forming: bool = True) -> list[Candle]:
@@ -868,6 +880,7 @@ class AlertEngine:
         while True:
             try:
                 await self._ensure_connected()
+                await self.client.keepalive()
                 for name, symbol in list(self.client.symbol_map.items()):
                     await self._scan_symbol(name, symbol)
                     await asyncio.sleep(0.2)  # spread requests within Deriv's rate budget
