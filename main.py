@@ -221,11 +221,6 @@ class DerivClient:
             "start": 1,
             "style": "candles",
             "granularity": granularity,
-            # The WebSocket server currently validates ticks_history against the
-            # legacy schema, where subscribe accepts only 1.  Keep this explicit
-            # rather than sending subscribe=0, which produces:
-            # "Input validation failed: subscribe / Not in enum list: 1."
-            "subscribe": 1,
         })
         raw = resp.get("candles", [])
         candles = [Candle(epoch=c["epoch"], open=float(c["open"]), high=float(c["high"]),
