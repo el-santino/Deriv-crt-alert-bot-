@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # Deriv current public market-data WebSocket
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # Deriv public market-data WebSocket
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
@@ -221,9 +221,11 @@ class DerivClient:
             "start": 1,
             "style": "candles",
             "granularity": granularity,
-            # New Deriv API: explicitly request a one-time historical response.
-            # This avoids the subscribe validation issue seen on the legacy endpoint.
-            "subscribe": 0,
+            # The WebSocket server currently validates ticks_history against the
+            # legacy schema, where subscribe accepts only 1.  Keep this explicit
+            # rather than sending subscribe=0, which produces:
+            # "Input validation failed: subscribe / Not in enum list: 1."
+            "subscribe": 1,
         })
         raw = resp.get("candles", [])
         candles = [Candle(epoch=c["epoch"], open=float(c["open"]), high=float(c["high"]),
