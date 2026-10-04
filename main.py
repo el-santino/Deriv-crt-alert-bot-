@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # public data, no app_id/auth needed
+DERIV_WS_URL = DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # public data, no app_id/auth needed
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
