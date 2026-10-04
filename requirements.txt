@@ -1,4 +1,4 @@
-websockets==14.1
+websockets==13.1
 python-telegram-bot==21.6
 openai==1.52.0
 google-genai==0.7.0
