@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # public market-data endpoint
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # Deriv public market-data WebSocket
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
@@ -160,14 +160,30 @@ class DerivClient:
     async def _send_recv(self, payload: dict, timeout: float = 20.0) -> dict:
         req_id = self._next_id()
         payload = {**payload, "req_id": req_id}
+
+        # Diagnostic logging: if Deriv reports a validation error, this records
+        # the EXACT request that this running process sent. This is important
+        # because the current get_candles() request does NOT send subscribe=1.
+        log.debug("Deriv request req_id=%s: %s", req_id, payload)
         await self.ws.send(json.dumps(payload))
+
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
             msg = json.loads(raw)
             if msg.get("req_id") == req_id:
                 if msg.get("error"):
-                    raise RuntimeError(f"Deriv API error: {msg['error']}")
+                    log.error(
+                        "Deriv API error for req_id=%s. Sent=%s | Response=%s | echo_req=%s",
+                        req_id,
+                        payload,
+                        msg.get("error"),
+                        msg.get("echo_req"),
+                    )
+                    raise RuntimeError(
+                        f"Deriv API error: {msg['error']} | request={payload} | "
+                        f"echo_req={msg.get('echo_req')}"
+                    )
                 return msg
         raise TimeoutError(f"Deriv API request timed out: {payload}")
 
@@ -859,42 +875,16 @@ class AlertEngine:
                 await self.client.connect()
                 return
             except Exception as exc:  # noqa: BLE001
-                log.exception(
-                    "Deriv connect failed: type=%s repr=%r. Retrying in %ds",
-                    type(exc).__name__,
-                    exc,
-                    delay,
-                )
+                log.error("Deriv connect failed (%s). Retrying in %ds", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
     async def _ensure_connected(self):
-        """
-        Check the WebSocket without assuming a particular websockets-version API.
-
-        websockets 13/14 may expose connection state through ``state`` rather than
-        the older ``closed`` property.  The old implementation wrapped the
-        ``.closed`` access in a broad try/except, so an AttributeError could be
-        mistaken for a real disconnect and cause a reconnect every poll cycle.
-        """
-        ws = self.client.ws
-
-        if ws is None:
-            log.warning("Deriv WebSocket is not connected. Reconnecting...")
-            await self._connect_with_retry()
-            return
-
-        state = getattr(ws, "state", None)
-        if state is not None:
-            state_name = getattr(state, "name", str(state)).upper()
-            if state_name == "CLOSED":
-                log.warning("Deriv WebSocket state is CLOSED. Reconnecting...")
-                await self._connect_with_retry()
-            return
-
-        # Fallback for older websockets implementations.
-        if getattr(ws, "closed", False):
-            log.warning("Deriv WebSocket is closed. Reconnecting...")
+        try:
+            if self.client.ws is None or self.client.ws.closed:
+                raise ConnectionError("socket closed")
+        except Exception:
+            log.warning("Reconnecting to Deriv...")
             await self._connect_with_retry()
 
     async def _heartbeat_loop(self):
@@ -911,11 +901,7 @@ class AlertEngine:
                     await self._scan_symbol(name, symbol)
                     await asyncio.sleep(0.2)  # spread requests within Deriv's rate budget
             except Exception as exc:  # noqa: BLE001
-                log.exception(
-                    "Poll loop error: type=%s repr=%r",
-                    type(exc).__name__,
-                    exc,
-                )
+                log.error("Poll loop error: %s", exc)
                 await asyncio.sleep(5)
             await asyncio.sleep(POLL_SECONDS)
 
