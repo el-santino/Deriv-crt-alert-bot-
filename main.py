@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # public data, no app_id/auth needed
+DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # public market-data endpoint
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
@@ -859,16 +859,42 @@ class AlertEngine:
                 await self.client.connect()
                 return
             except Exception as exc:  # noqa: BLE001
-                log.error("Deriv connect failed (%s). Retrying in %ds", exc, delay)
+                log.exception(
+                    "Deriv connect failed: type=%s repr=%r. Retrying in %ds",
+                    type(exc).__name__,
+                    exc,
+                    delay,
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
 
     async def _ensure_connected(self):
-        try:
-            if self.client.ws is None or self.client.ws.closed:
-                raise ConnectionError("socket closed")
-        except Exception:
-            log.warning("Reconnecting to Deriv...")
+        """
+        Check the WebSocket without assuming a particular websockets-version API.
+
+        websockets 13/14 may expose connection state through ``state`` rather than
+        the older ``closed`` property.  The old implementation wrapped the
+        ``.closed`` access in a broad try/except, so an AttributeError could be
+        mistaken for a real disconnect and cause a reconnect every poll cycle.
+        """
+        ws = self.client.ws
+
+        if ws is None:
+            log.warning("Deriv WebSocket is not connected. Reconnecting...")
+            await self._connect_with_retry()
+            return
+
+        state = getattr(ws, "state", None)
+        if state is not None:
+            state_name = getattr(state, "name", str(state)).upper()
+            if state_name == "CLOSED":
+                log.warning("Deriv WebSocket state is CLOSED. Reconnecting...")
+                await self._connect_with_retry()
+            return
+
+        # Fallback for older websockets implementations.
+        if getattr(ws, "closed", False):
+            log.warning("Deriv WebSocket is closed. Reconnecting...")
             await self._connect_with_retry()
 
     async def _heartbeat_loop(self):
@@ -885,7 +911,11 @@ class AlertEngine:
                     await self._scan_symbol(name, symbol)
                     await asyncio.sleep(0.2)  # spread requests within Deriv's rate budget
             except Exception as exc:  # noqa: BLE001
-                log.error("Poll loop error: %s", exc)
+                log.exception(
+                    "Poll loop error: type=%s repr=%r",
+                    type(exc).__name__,
+                    exc,
+                )
                 await asyncio.sleep(5)
             await asyncio.sleep(POLL_SECONDS)
 
