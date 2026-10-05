@@ -117,6 +117,12 @@ LONG_WICK_ATR_MULT = 1
 MODEL1_WINDOW_UTC_HOURS = (16, 24)   # evaluate Model 1 setup only in this UTC hour range
 MODEL2_WINDOW_MINUTES_INTO_H4 = (180, 240)  # last 60 min of the 4H candle
 BOS_LOOKBACK_CANDLES = 100  # how far back to search for the most recent structure break
+# How many of the most recent candles to consider when forming POIs (FVG/OB/A-V Level/
+# QML/etc). Drastically shortened from the full 300-candle fetch — a 300-candle lookback
+# let too many old, still-"unmitigated" POIs accumulate (seen: 35-49 matching POIs for a
+# single confirmed bias), which flooded Telegram with 10+ alerts at once. A much shorter
+# window keeps only genuinely recent, relevant levels.
+POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "60"))
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +598,26 @@ def gather_pois(candles: list[Candle], timeframe: str) -> list[dict]:
     return pois
 
 
+def cap_nearest_per_type(pois: list[dict], current_price: float) -> list[dict]:
+    """Keep only the single POI nearest to current price per (type, direction)
+    combination. Without this, a confirmed bias could carry 30-50+ technically-
+    valid POIs simultaneously, each capable of triggering its own alert —
+    exactly what caused a flood of 10+ messages at once. This keeps the most
+    actionable (closest-to-price) level of each kind and drops the rest."""
+    def distance(poi: dict) -> float:
+        if "level" in poi:
+            return abs(poi["level"] - current_price)
+        mid = (poi["zone_low"] + poi["zone_high"]) / 2
+        return abs(mid - current_price)
+
+    nearest: dict[tuple, dict] = {}
+    for poi in pois:
+        key = (poi["type"], poi["direction"])
+        if key not in nearest or distance(poi) < distance(nearest[key]):
+            nearest[key] = poi
+    return list(nearest.values())
+
+
 def merge_confluence(pois_a: list[dict], pois_b: list[dict]) -> list[dict]:
     """If the same POI type+direction overlaps across two timeframes, merge
     into ONE entry listing both timeframes as confluence (Model 2, 3.2.3)."""
@@ -641,8 +667,11 @@ async def check_model1(client: DerivClient, symbol: str) -> Optional[dict]:
                   symbol, direction, agree, flows["H4"], flows["H2"], flows["H1"])
         return {"verdict": "invalidated", "model": "daily_crt"}
 
-    pois = [p for p in gather_pois(h4, "H4") + gather_pois(h2, "H2") + gather_pois(h1, "H1")
+    pois = [p for p in gather_pois(h4[-POI_LOOKBACK_CANDLES:], "H4") +
+            gather_pois(h2[-POI_LOOKBACK_CANDLES:], "H2") +
+            gather_pois(h1[-POI_LOOKBACK_CANDLES:], "H1")
             if p["direction"] == direction]
+    pois = cap_nearest_per_type(pois, h1[-1].close)
     if not pois:
         log.info("[%s] Model1: D1 BOS=%s, LTFs agree (%d/3), but no matching unmitigated POI found",
                   symbol, direction, agree)
@@ -679,9 +708,10 @@ async def check_model2(client: DerivClient, symbol: str) -> Optional[dict]:
                   symbol, direction, flow30, flow15)
         return {"verdict": "invalidated", "model": "4h_crt"}
 
-    pois30 = [p for p in gather_pois(m30, "M30") if p["direction"] == direction]
-    pois15 = [p for p in gather_pois(m15, "M15") if p["direction"] == direction]
+    pois30 = [p for p in gather_pois(m30[-POI_LOOKBACK_CANDLES:], "M30") if p["direction"] == direction]
+    pois15 = [p for p in gather_pois(m15[-POI_LOOKBACK_CANDLES:], "M15") if p["direction"] == direction]
     merged = merge_confluence(pois30, pois15)
+    merged = cap_nearest_per_type(merged, m15[-1].close)
     if not merged:
         log.info("[%s] Model2: H4 BOS=%s, M30/M15 agree, but no matching unmitigated POI found",
                   symbol, direction)
