@@ -75,7 +75,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
         f"real tokens only contain digits, letters, underscores, hyphens, and one colon."
     )
 
-DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3"  # Deriv public market-data WebSocket
+DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # public data, no app_id/auth needed
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
@@ -160,30 +160,14 @@ class DerivClient:
     async def _send_recv(self, payload: dict, timeout: float = 20.0) -> dict:
         req_id = self._next_id()
         payload = {**payload, "req_id": req_id}
-
-        # Diagnostic logging: if Deriv reports a validation error, this records
-        # the EXACT request that this running process sent. This is important
-        # because the current get_candles() request does NOT send subscribe=1.
-        log.info("Deriv request req_id=%s: %s", req_id, payload)
         await self.ws.send(json.dumps(payload))
-
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
             msg = json.loads(raw)
             if msg.get("req_id") == req_id:
                 if msg.get("error"):
-                    log.error(
-                        "Deriv API error for req_id=%s. Sent=%s | Response=%s | echo_req=%s",
-                        req_id,
-                        payload,
-                        msg.get("error"),
-                        msg.get("echo_req"),
-                    )
-                    raise RuntimeError(
-                        f"Deriv API error: {msg['error']} | request={payload} | "
-                        f"echo_req={msg.get('echo_req')}"
-                    )
+                    raise RuntimeError(f"Deriv API error: {msg['error']}")
                 return msg
         raise TimeoutError(f"Deriv API request timed out: {payload}")
 
