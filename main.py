@@ -14,6 +14,16 @@ that payload (see call_ai_narration). If the AI call fails, a plain template
 built directly from the payload is sent instead — an alert is never skipped
 because of an AI failure.
 
+SETUP LIFECYCLE: a setup is REGISTERED when a 2-candle BOS is confirmed by the LTFs
+(Model 1 may register early, in the last 8h of candle 2; both models also register from
+the last two CLOSED candles). It then stays LIVE through the whole third candle and is
+watched for POI touches at ANY time — the evaluation windows only gate when new setups
+are first spotted early. Candle 1 is the dealing range (a POI must form inside it) and its
+far extreme is the invalidation level: an LTF close beyond it kills the setup. Every alert
+carries a code-computed confluence checklist. Active setups are saved to STATE_PATH.
+Only ICT/SMC POIs trigger alerts by default (POI_FAMILY=ictsmc); MSNR levels still count
+as confluence. POIs must form INSIDE candle 1's range; there is no premium/discount rule.
+
 HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG/BPR, Order/
 Propulsion/Breaker/Mitigation/Rejection Blocks, A/V Level, QML) are
 deterministic, rule-based implementations of the definitions given for this
@@ -27,6 +37,7 @@ financial advice.
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -123,6 +134,70 @@ BOS_LOOKBACK_CANDLES = 100  # how far back to search for the most recent structu
 # single confirmed bias), which flooded Telegram with 10+ alerts at once. A much shorter
 # window keeps only genuinely recent, relevant levels.
 POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "60"))
+# Deriv meters ticks_history separately as "normal" vs "expensive" and the expensive
+# bucket is much tighter — a burst of 300-candle requests across 37 symbols right after
+# a cold start/restart was enough to exhaust it in under a second (seen in practice).
+# Nothing in this bot actually needs more than ~130 candles (BOS_LOOKBACK_CANDLES=100 is
+# the deepest lookback used), so the default request size is cut well below the old 300.
+CANDLE_FETCH_COUNT = int(os.environ.get("CANDLE_FETCH_COUNT", "150"))
+# Minimum seconds between ANY two candle fetches, enforced globally (not per-symbol) —
+# this is what actually spreads out a cold-start burst across many symbols.
+CANDLE_FETCH_MIN_GAP = float(os.environ.get("CANDLE_FETCH_MIN_GAP", "0.6"))
+# Extra pause, shared by every symbol, the moment Deriv reports the expensive-call limit hit.
+CANDLE_FETCH_BACKOFF = int(os.environ.get("CANDLE_FETCH_BACKOFF", "15"))
+
+
+def _choice(env_name: str, default: str, allowed: tuple) -> str:
+    value = os.environ.get(env_name, default).strip().lower()
+    if value not in allowed:
+        logging.getLogger("crt_alert_bot").warning(
+            "%s=%r is not one of %s — using default %r", env_name, value, allowed, default)
+        return default
+    return value
+
+
+# Candle 1 is the "range" candle of a CRT setup. It is used two ways:
+#  - INVALIDATION: "candle1" = a close beyond candle 1's FAR extreme kills the setup
+#    (bullish: close below candle 1's low; bearish: close above its high).
+#    "candle1_eq" = a close beyond candle 1's 50% instead (tighter).
+#    "candle2"    = the old behaviour (candle 2's far extreme).
+#  - DEALING RANGE: the setup must FORM inside candle 1's high-low.
+#    "inside"  = the POI must sit entirely within candle 1's range (default).
+#    "overlap" = the POI only has to overlap candle 1's range.
+#    "off"     = no dealing-range filter.
+#    There is deliberately NO premium/discount rule.
+INVALIDATION_MODE = _choice("INVALIDATION_MODE", "candle1", ("candle1", "candle1_eq", "candle2"))
+DEALING_RANGE_MODE = _choice("DEALING_RANGE_MODE", "inside", ("inside", "overlap", "off"))
+# Alerts below this checklist score (out of 5) are suppressed. 0 = show the checklist
+# but never suppress. Raise it (e.g. 3 or 4) once you've seen typical scores.
+MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "0"))
+
+# POI families.
+ICT_SMC_POIS = {"fvg", "ifvg", "bpr", "order_block", "propulsion_block",
+                "breaker_block", "mitigation_block", "rejection_block"}
+MSNR_POIS = {"a_level", "v_level", "qml", "qmc"}
+# POI_FAMILY: "ictsmc" (default) = only ICT/SMC POIs can TRIGGER an alert. MSNR levels are
+# still detected and still count as confluence on the checklist, they just can't fire an
+# alert on their own. "all" = MSNR levels can trigger alerts too.
+POI_FAMILY = _choice("POI_FAMILY", "ictsmc", ("ictsmc", "all"))
+
+# When several POIs are touched at once, the highest-priority (lowest number) is alerted.
+POI_PRIORITY = {
+    "breaker_block": 0, "mitigation_block": 1, "order_block": 2, "propulsion_block": 3,
+    "ifvg": 4, "bpr": 5, "rejection_block": 6, "fvg": 7,
+    "qmc": 8, "qml": 9, "v_level": 10, "a_level": 10,
+}
+# ICT/SMC types that are NOT the plain FVG (the checklist treats these as "high-grade").
+HIGH_GRADE_POIS = {"order_block", "propulsion_block", "breaker_block", "mitigation_block",
+                   "ifvg", "bpr", "rejection_block"}
+
+# LTFs used by each model, which LTF's close decides invalidation, and how long a setup
+# stays live. A setup is live through the whole THIRD candle (candle 2 start + 2 candles).
+MODEL_LTFS = {"daily_crt": ("H4", "H2", "H1"), "4h_crt": ("M30", "M15")}
+MODEL_LTFS_REQUIRED = {"daily_crt": 2, "4h_crt": 2}   # how many LTFs must agree
+MODEL_REF_TF = {"daily_crt": "H1", "4h_crt": "M15"}   # close of this TF checks invalidation
+MODEL_BOS_TF = {"daily_crt": "D1", "4h_crt": "H4"}
+MODEL_TITLES = {"daily_crt": "Daily CRT", "4h_crt": "4H CRT"}
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +223,9 @@ class DerivClient:
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.symbol_map: dict[str, str] = {}
         self._req_id = 0
+        self._cache: dict[tuple, tuple] = {}  # (symbol, gran, count, drop_forming) -> (candles, fetched_at)
+        self._candle_lock = asyncio.Lock()
+        self._last_candle_call = 0.0
 
     async def connect(self):
         # ping_interval=None disables the low-level WebSocket protocol ping/pong.
@@ -201,17 +279,58 @@ class DerivClient:
         WebSocket protocol ping, which this endpoint does not appear to answer."""
         await self._send_recv({"ping": 1}, timeout=10)
 
-    async def get_candles(self, symbol: str, granularity: int, count: int = 300,
+    async def get_candles_cached(self, symbol: str, granularity: int, count: int = CANDLE_FETCH_COUNT,
+                                  drop_forming: bool = True, ttl: Optional[float] = None) -> list[Candle]:
+        """Cached candle fetch, to stay inside Deriv's 220 requests/minute budget now
+        that setups are monitored continuously.
+        - Confirmed-candle lists (drop_forming=True) only change when a new candle
+          closes, so they are reused until then (no API call).
+        - Lists that include the forming candle need a ttl (seconds) to be reused."""
+        key = (symbol, granularity, count, drop_forming)
+        now = time.time()
+        entry = self._cache.get(key)
+        if entry:
+            candles, fetched_at = entry
+            if drop_forming:
+                if candles and now < candles[-1].epoch + 2 * granularity + 2:
+                    return candles
+            elif ttl is not None and now - fetched_at < ttl:
+                return candles
+        candles = await self.get_candles(symbol, granularity, count, drop_forming)
+        self._cache[key] = (candles, now)
+        return candles
+
+    async def get_candles(self, symbol: str, granularity: int, count: int = CANDLE_FETCH_COUNT,
                            drop_forming: bool = True) -> list[Candle]:
-        resp = await self._send_recv({
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": count,
-            "end": "latest",
-            "start": 1,
-            "style": "candles",
-            "granularity": granularity,
-        })
+        # Every candle fetch (this is Deriv's "expensive" ticks_history call) is paced through
+        # ONE shared lock, regardless of which symbol or model triggered it. A per-symbol
+        # backoff alone does not stop the NEXT symbol's request firing immediately after a
+        # RateLimit error — this closes that gap. CANDLE_FETCH_MIN_GAP is generous enough
+        # that a cold start (37 symbols x several timeframes, no cache yet) spreads out
+        # instead of bursting all at once.
+        async with self._candle_lock:
+            wait = CANDLE_FETCH_MIN_GAP - (time.monotonic() - self._last_candle_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                resp = await self._send_recv({
+                    "ticks_history": symbol,
+                    "adjust_start_time": 1,
+                    "count": count,
+                    "end": "latest",
+                    "start": 1,
+                    "style": "candles",
+                    "granularity": granularity,
+                })
+            except RuntimeError as exc:
+                if "RateLimit" in str(exc):
+                    # Back off BEFORE releasing the lock, so every other symbol waiting on
+                    # this same lock is slowed down too, not just this one.
+                    log.warning("Hit Deriv's ticks_history rate limit — pausing %ds for ALL symbols", CANDLE_FETCH_BACKOFF)
+                    await asyncio.sleep(CANDLE_FETCH_BACKOFF)
+                self._last_candle_call = time.monotonic()
+                raise
+            self._last_candle_call = time.monotonic()
         raw = resp.get("candles", [])
         candles = [Candle(epoch=c["epoch"], open=float(c["open"]), high=float(c["high"]),
                            low=float(c["low"]), close=float(c["close"])) for c in raw]
@@ -315,10 +434,12 @@ def detect_fvgs(candles: list[Candle]) -> list[dict]:
         c1, c3 = candles[i - 1], candles[i + 1]
         if c1.high < c3.low:
             out.append({"type": "fvg", "direction": "bullish", "zone_low": c1.high,
-                        "zone_high": c3.low, "epoch": candles[i].epoch})
+                        "zone_high": c3.low, "epoch": candles[i].epoch,
+                        "armed_epoch": c3.epoch})
         elif c1.low > c3.high:
             out.append({"type": "fvg", "direction": "bearish", "zone_low": c3.high,
-                        "zone_high": c1.low, "epoch": candles[i].epoch})
+                        "zone_high": c1.low, "epoch": candles[i].epoch,
+                        "armed_epoch": c3.epoch})
     return out
 
 
@@ -339,7 +460,8 @@ def detect_ifvgs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
             if breached and is_displacement(c, candles[:j + 1]):
                 flipped = "bearish" if fvg["direction"] == "bullish" else "bullish"
                 out.append({"type": "ifvg", "direction": flipped, "zone_low": fvg["zone_low"],
-                            "zone_high": fvg["zone_high"], "epoch": c.epoch})
+                            "zone_high": fvg["zone_high"], "epoch": c.epoch,
+                            "armed_epoch": c.epoch})
                 break
     return out
 
@@ -361,9 +483,13 @@ def detect_bprs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
                 continue
             lo, hi = max(b["zone_low"], s["zone_low"]), min(b["zone_high"], s["zone_high"])
             if lo < hi:
-                epoch = candles[max(bi, si)].epoch
-                out.append({"type": "bpr", "direction": "bullish", "zone_low": lo, "zone_high": hi, "epoch": epoch})
-                out.append({"type": "bpr", "direction": "bearish", "zone_low": lo, "zone_high": hi, "epoch": epoch})
+                later = max(bi, si)
+                epoch = candles[later].epoch
+                armed = candles[min(later + 1, len(candles) - 1)].epoch
+                out.append({"type": "bpr", "direction": "bullish", "zone_low": lo, "zone_high": hi,
+                            "epoch": epoch, "armed_epoch": armed})
+                out.append({"type": "bpr", "direction": "bearish", "zone_low": lo, "zone_high": hi,
+                            "epoch": epoch, "armed_epoch": armed})
     return out
 
 
@@ -384,11 +510,11 @@ def detect_order_blocks(candles: list[Candle]) -> list[dict]:
         if c.close > c.open and prior_highs and c.close > prior_highs[-1] and prior_candle.close < prior_candle.open:
             out.append({"type": "order_block", "direction": "bullish", "zone_low": prior_candle.low,
                         "zone_high": prior_candle.high, "epoch": prior_candle.epoch,
-                        "swept_extreme": prior_highs[-1]})
+                        "armed_epoch": c.epoch, "swept_extreme": prior_highs[-1]})
         elif c.close < c.open and prior_lows and c.close < prior_lows[-1] and prior_candle.close > prior_candle.open:
             out.append({"type": "order_block", "direction": "bearish", "zone_low": prior_candle.low,
                         "zone_high": prior_candle.high, "epoch": prior_candle.epoch,
-                        "swept_extreme": prior_lows[-1]})
+                        "armed_epoch": c.epoch, "swept_extreme": prior_lows[-1]})
     return out
 
 
@@ -433,7 +559,8 @@ def detect_breaker_and_mitigation_blocks(candles: list[Candle], obs: list[dict])
                 if opposite_break:
                     flipped = {"type": "breaker_block" if swept else "mitigation_block",
                                "direction": "bearish" if ob["direction"] == "bullish" else "bullish",
-                               "zone_low": ob["zone_low"], "zone_high": ob["zone_high"], "epoch": ob["epoch"]}
+                               "zone_low": ob["zone_low"], "zone_high": ob["zone_high"], "epoch": ob["epoch"],
+                               "armed_epoch": c.epoch}
                     (breakers if swept else mitigations).append(flipped)
                     break
     return breakers, mitigations
@@ -453,13 +580,15 @@ def detect_rejection_blocks(candles: list[Candle]) -> list[dict]:
         w, b = upper_wick(c), body(c)
         if b > 0 and w >= LONG_WICK_BODY_MULT * b and w >= LONG_WICK_ATR_MULT * a:
             out.append({"type": "rejection_block", "direction": "bearish", "level": c.high - w / 2,
-                        "epoch": c.epoch})
+                        "epoch": c.epoch,
+                        "armed_epoch": candles[min(idx + SWING_N, len(candles) - 1)].epoch})
     for idx, _ in lows:
         c = candles[idx]
         w, b = lower_wick(c), body(c)
         if b > 0 and w >= LONG_WICK_BODY_MULT * b and w >= LONG_WICK_ATR_MULT * a:
             out.append({"type": "rejection_block", "direction": "bullish", "level": c.low + w / 2,
-                        "epoch": c.epoch})
+                        "epoch": c.epoch,
+                        "armed_epoch": candles[min(idx + SWING_N, len(candles) - 1)].epoch})
     return out
 
 
@@ -467,24 +596,21 @@ def detect_a_v_levels(candles: list[Candle]) -> list[dict]:
     """MSNR A Level: a peak CLOSE (close[i] > close[i-1] and close[i] >
     close[i+1]) on a close-only line chart — acts as resistance.
     MSNR V Level: the mirror valley close — acts as support.
-    Both are 'fresh' only until a later candle's range revisits the level."""
+    Freshness (not yet revisited) is enforced centrally in filter_unmitigated,
+    counting only candles AFTER the confirming candle i+1 — the candle right
+    after a peak/valley opens at about the same price, so it would otherwise
+    always count as a 'revisit'."""
     out = []
     for i in range(1, len(candles) - 1):
         c = candles[i]
+        armed = candles[i + 1].epoch
         if c.close > candles[i - 1].close and c.close > candles[i + 1].close:
-            out.append({"type": "a_level", "direction": "bearish", "level": c.close, "epoch": c.epoch})
+            out.append({"type": "a_level", "direction": "bearish", "level": c.close,
+                        "epoch": c.epoch, "armed_epoch": armed})
         if c.close < candles[i - 1].close and c.close < candles[i + 1].close:
-            out.append({"type": "v_level", "direction": "bullish", "level": c.close, "epoch": c.epoch})
-    fresh = []
-    idx_by_epoch = {c.epoch: i for i, c in enumerate(candles)}
-    for lv in out:
-        origin = idx_by_epoch.get(lv["epoch"])
-        if origin is None:
-            continue
-        touched = any(c.low <= lv["level"] <= c.high for c in candles[origin + 1:])
-        if not touched:
-            fresh.append(lv)
-    return fresh
+            out.append({"type": "v_level", "direction": "bullish", "level": c.close,
+                        "epoch": c.epoch, "armed_epoch": armed})
+    return out
 
 
 def detect_qml(candles: list[Candle]) -> list[dict]:
@@ -506,7 +632,8 @@ def detect_qml(candles: list[Candle]) -> list[dict]:
         for j in range(idx2 + 1, len(candles)):
             if candles[j].close < neckline:
                 out.append({"type": "qml", "direction": "bearish", "level": shoulder,
-                            "epoch": candles[idx1].epoch, "confirmed_epoch": candles[j].epoch})
+                            "epoch": candles[idx1].epoch, "confirmed_epoch": candles[j].epoch,
+                            "armed_epoch": candles[j].epoch})
                 break
     for i in range(len(lows) - 1):
         idx1, shoulder = lows[i]
@@ -520,7 +647,8 @@ def detect_qml(candles: list[Candle]) -> list[dict]:
         for j in range(idx2 + 1, len(candles)):
             if candles[j].close > neckline:
                 out.append({"type": "qml", "direction": "bullish", "level": shoulder,
-                            "epoch": candles[idx1].epoch, "confirmed_epoch": candles[j].epoch})
+                            "epoch": candles[idx1].epoch, "confirmed_epoch": candles[j].epoch,
+                            "armed_epoch": candles[j].epoch})
                 break
     return out
 
@@ -543,31 +671,39 @@ def detect_qmc(candles: list[Candle], qmls: list[dict]) -> list[dict]:
             if not (c.low <= qml["level"] <= c.high):
                 continue
             if qml["direction"] == "bearish" and c.close < qml["level"]:
-                out.append({"type": "qmc", "direction": "bearish", "level": qml["level"], "epoch": c.epoch})
+                out.append({"type": "qmc", "direction": "bearish", "level": qml["level"], "epoch": c.epoch,
+                            "armed_epoch": c.epoch})
                 break
             if qml["direction"] == "bullish" and c.close > qml["level"]:
-                out.append({"type": "qmc", "direction": "bullish", "level": qml["level"], "epoch": c.epoch})
+                out.append({"type": "qmc", "direction": "bullish", "level": qml["level"], "epoch": c.epoch,
+                            "armed_epoch": c.epoch})
                 break
     return out
 
 
 def filter_unmitigated(pois: list[dict], candles: list[Candle]) -> list[dict]:
-    """Only unmitigated zones count: price must not have traded into a
-    zone-based POI (wick or body overlap) since it formed. Level-based POIs
-    (A/V Level, QML, Rejection Block, QMC) use their own 'fresh'/one-shot
-    logic upstream and pass through here unchanged."""
+    """Keep only POIs price has NOT revisited since they finished forming.
+    - Zone POIs (FVG/IFVG/BPR/OB/Propulsion/Breaker/Mitigation): mitigated if any
+      later candle's range overlaps the zone.
+    - Level POIs (A/V Level, QML, QMC, Rejection Block): stale if any later
+      candle's range contains the level.
+    'Later' means strictly AFTER the POI's armed_epoch (the last candle that
+    forms the pattern). Counting from the pattern's own candles was a bug: an
+    order block's creating displacement candle always opens inside the block,
+    and an FVG's third candle always touches the gap edge, so every zone POI
+    was being discarded the moment it formed."""
     idx_by_epoch = {c.epoch: i for i, c in enumerate(candles)}
     out = []
     for poi in pois:
-        if "zone_low" not in poi:
-            out.append(poi)
-            continue
-        origin = idx_by_epoch.get(poi["epoch"])
-        if origin is None:
-            out.append(poi)
-            continue
-        mitigated = any(c.low <= poi["zone_high"] and c.high >= poi["zone_low"] for c in candles[origin + 1:])
-        if not mitigated:
+        armed_idx = idx_by_epoch.get(poi.get("armed_epoch", poi["epoch"]))
+        if armed_idx is None:
+            continue  # pattern's forming candle no longer in the window
+        later = candles[armed_idx + 1:]
+        if "zone_low" in poi:
+            revisited = any(c.low <= poi["zone_high"] and c.high >= poi["zone_low"] for c in later)
+        else:
+            revisited = any(c.low <= poi["level"] <= c.high for c in later)
+        if not revisited:
             out.append(poi)
     return out
 
@@ -638,90 +774,168 @@ def merge_confluence(pois_a: list[dict], pois_b: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Model checks
+# Setup helpers: candle-1 dealing range, invalidation, POI selection, checklist
 # ---------------------------------------------------------------------------
 
-async def check_model1(client: DerivClient, symbol: str) -> Optional[dict]:
-    """Model 1: Daily CRT Continuation (spec 3.1)."""
-    now = datetime.now(timezone.utc)
-    if not (MODEL1_WINDOW_UTC_HOURS[0] <= now.hour < MODEL1_WINDOW_UTC_HOURS[1]):
-        return None  # outside the 16:00-24:00 UTC evaluation window — logged once at debug level is noisy, skip
-    d1 = await client.get_candles(symbol, GRAN["D1"], count=10, drop_forming=False)
-    if len(d1) < 2:
-        log.debug("[%s] Model1: not enough D1 candles", symbol)
-        return None
-    candle1, candle2 = d1[-2], d1[-1]
-    direction = two_candle_bos(candle1, candle2)
-    if direction is None:
-        log.info("[%s] Model1: no 2-candle D1 BOS (c1 H/L=%.5f/%.5f, c2 H/L=%.5f/%.5f)",
-                  symbol, candle1.high, candle1.low, candle2.high, candle2.low)
-        return None
-
-    h4 = await client.get_candles(symbol, GRAN["H4"])
-    h2 = await client.get_candles(symbol, GRAN["H2"])
-    h1 = await client.get_candles(symbol, GRAN["H1"])
-    flows = {"H4": compute_orderflow(h4), "H2": compute_orderflow(h2), "H1": compute_orderflow(h1)}
-    agree = sum(1 for f in flows.values() if f == direction)
-    if agree < 2:
-        log.info("[%s] Model1: D1 BOS=%s but only %d/3 LTFs agree (H4=%s H2=%s H1=%s) — invalidated",
-                  symbol, direction, agree, flows["H4"], flows["H2"], flows["H1"])
-        return {"verdict": "invalidated", "model": "daily_crt"}
-
-    pois = [p for p in gather_pois(h4[-POI_LOOKBACK_CANDLES:], "H4") +
-            gather_pois(h2[-POI_LOOKBACK_CANDLES:], "H2") +
-            gather_pois(h1[-POI_LOOKBACK_CANDLES:], "H1")
-            if p["direction"] == direction]
-    pois = cap_nearest_per_type(pois, h1[-1].close)
-    if not pois:
-        log.info("[%s] Model1: D1 BOS=%s, LTFs agree (%d/3), but no matching unmitigated POI found",
-                  symbol, direction, agree)
-    else:
-        log.info("[%s] Model1: CONFIRMED %s bias, %d matching POI(s) found", symbol, direction, len(pois))
-    invalidation = candle2.low if direction == "bullish" else candle2.high
-    return {"verdict": direction, "model": "daily_crt", "symbol": symbol,
-            "bos_candle1": candle1, "bos_candle2": candle2, "ltf_flows": flows,
-            "pois": pois, "invalidation": invalidation}
+_last_log: dict[str, str] = {}
 
 
-async def check_model2(client: DerivClient, symbol: str) -> Optional[dict]:
-    """Model 2: 4H CRT Continuation (spec 3.2)."""
+def log_change(key: str, msg: str, *args):
+    """Log at INFO only when the message for this key CHANGES — otherwise the
+    per-poll 'no BOS' / 'LTFs disagree' lines would repeat every 30 seconds."""
+    text = msg % args if args else msg
+    if _last_log.get(key) != text:
+        _last_log[key] = text
+        log.info("%s", text)
+
+
+def fmt_price(x: float) -> str:
+    return ("%.5f" % x).rstrip("0").rstrip(".")
+
+
+def candle_to_dict(c: Candle) -> dict:
+    return {"epoch": c.epoch, "open": c.open, "high": c.high, "low": c.low, "close": c.close}
+
+
+def compute_invalidation(c1: Candle, c2: Candle, direction: str) -> float:
+    """Invalidation level per INVALIDATION_MODE (default: candle 1's FAR extreme)."""
+    if INVALIDATION_MODE == "candle2":
+        return c2.low if direction == "bullish" else c2.high
+    if INVALIDATION_MODE == "candle1_eq":
+        return (c1.high + c1.low) / 2
+    return c1.low if direction == "bullish" else c1.high
+
+
+def is_invalidated(close: float, direction: str, level: float) -> bool:
+    """A CLOSE beyond the level invalidates the setup (a wick alone does not)."""
+    return close < level if direction == "bullish" else close > level
+
+
+def poi_bounds(poi: dict) -> tuple[float, float]:
+    if "zone_low" in poi:
+        return poi["zone_low"], poi["zone_high"]
+    return poi["level"], poi["level"]
+
+
+def poi_in_dealing_range(poi: dict, direction: str, c1_low: float, c1_high: float) -> bool:
+    """Candle 1's high-low is the dealing range; the setup must FORM inside it.
+    See DEALING_RANGE_MODE. (No premium/discount split — by design.)"""
+    if DEALING_RANGE_MODE == "off":
+        return True
+    p_lo, p_hi = poi_bounds(poi)
+    if DEALING_RANGE_MODE == "overlap":
+        return p_hi >= c1_low and p_lo <= c1_high
+    return p_lo >= c1_low and p_hi <= c1_high  # "inside": entirely within candle 1's range
+
+
+def poi_priority(poi: dict) -> int:
+    return POI_PRIORITY.get(poi["type"], 99)
+
+
+def build_checklist(setup: dict, poi: dict, other_pois: list[dict], flows: dict, m1: Candle) -> list[tuple[str, bool]]:
+    """Objective, code-computed confluence checklist. Every item is a yes/no fact
+    from the data — nothing subjective, and the AI never writes or alters it."""
+    d = setup["direction"]
+    c1_low, c1_high = setup["c1"]["low"], setup["c1"]["high"]
+    p_lo, p_hi = poi_bounds(poi)
+    # Confluence: any OTHER POI of a different type overlapping this one (MSNR levels count),
+    # or the same POI confirmed on two timeframes (Model 2 merges M30+M15).
+    stacked = "+" in poi["timeframe"] or any(
+        o is not poi and o["type"] != poi["type"]
+        and poi_bounds(o)[1] >= p_lo and poi_bounds(o)[0] <= p_hi
+        for o in other_pois)
+    reacted = (m1.close > p_hi) if d == "bullish" else (m1.close < p_lo)
+    return [
+        (f"All LTFs agree with the {d} bias ({'/'.join(flows.keys())})", all(f == d for f in flows.values())),
+        ("POI formed inside candle 1's range", p_lo >= c1_low and p_hi <= c1_high),
+        (f"ICT/SMC high-grade POI ({poi['type'].replace('_', ' ')})", poi["type"] in HIGH_GRADE_POIS),
+        ("POI confluence (stacked POI or multi-timeframe)", stacked),
+        ("M1 closed back out in the bias direction (rejection)", reacted),
+    ]
+
+
+def make_setup(name: str, symbol: str, model: str, direction: str, c1: Candle, c2: Candle,
+               flows: dict, c2_len_seconds: int) -> dict:
+    return {
+        "id": f"{name}|{model}|{c2.epoch}",
+        "name": name, "symbol": symbol, "model": model, "direction": direction,
+        "c1": candle_to_dict(c1), "c2": candle_to_dict(c2),
+        "ltf_flows": flows,
+        "invalidation": compute_invalidation(c1, c2, direction),
+        "ref_tf": MODEL_REF_TF[model],
+        # live through the whole THIRD candle: candle 2 start + 2 candle lengths
+        "valid_until": c2.epoch + 2 * c2_len_seconds,
+        "created": time.time(),
+        "alerted": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Model setup detection (spec 3.1 / 3.2). These only FIND and CONFIRM setups.
+# Watching them for POI touches happens in AlertEngine._monitor_symbol and is NOT
+# restricted to the evaluation windows.
+# ---------------------------------------------------------------------------
+
+async def _detect_setup(client: DerivClient, name: str, symbol: str, model: str, known_ids: set,
+                        in_window: bool) -> Optional[dict]:
+    bos_tf = MODEL_BOS_TF[model]
+    gran = GRAN[bos_tf]
+    label = "Model1" if model == "daily_crt" else "Model2"
+
+    pairs = []
+    if in_window:
+        # Early read: candle 2 is still forming (spec: evaluate before candle 2 closes).
+        forming = await client.get_candles_cached(symbol, gran, count=10, drop_forming=False, ttl=60)
+        if len(forming) >= 2:
+            pairs.append((forming[-2], forming[-1]))
+    # Always also consider the last two CLOSED candles: the setup stays live through
+    # the third candle (the current one), so this keeps it alive after the window ends
+    # and rebuilds it after a restart.
+    closed = await client.get_candles_cached(symbol, gran, count=10, drop_forming=True)
+    if len(closed) >= 2:
+        pairs.append((closed[-2], closed[-1]))
+
+    now = time.time()
+    for c1, c2 in pairs:
+        if now >= c2.epoch + 2 * gran:
+            continue  # third candle already over
+        direction = two_candle_bos(c1, c2)
+        setup_id = f"{name}|{model}|{c2.epoch}"
+        if direction is None:
+            log_change(f"{label}:{name}:{c2.epoch}", "[%s] %s: no 2-candle %s BOS (c1 H/L=%s/%s, c2 H/L=%s/%s)",
+                       name, label, bos_tf, fmt_price(c1.high), fmt_price(c1.low),
+                       fmt_price(c2.high), fmt_price(c2.low))
+            continue
+        if setup_id in known_ids:
+            continue
+        ltfs = MODEL_LTFS[model]
+        ltf_candles = {tf: await client.get_candles_cached(symbol, GRAN[tf]) for tf in ltfs}
+        flows = {tf: compute_orderflow(c) for tf, c in ltf_candles.items()}
+        agree = sum(1 for f in flows.values() if f == direction)
+        need = MODEL_LTFS_REQUIRED[model]
+        if agree < need:
+            log_change(f"{label}:{name}:{c2.epoch}:flows",
+                       "[%s] %s: %s BOS=%s but only %d/%d LTFs agree (%s) — not confirmed",
+                       name, label, bos_tf, direction, agree, len(ltfs),
+                       " ".join(f"{tf}={f}" for tf, f in flows.items()))
+            continue
+        return make_setup(name, symbol, model, direction, c1, c2, flows, gran)
+    return None
+
+
+async def check_model1(client: DerivClient, name: str, symbol: str, known_ids: set) -> Optional[dict]:
+    """Model 1: Daily CRT Continuation (spec 3.1). BOS on D1, LTFs H4/H2/H1 (2 of 3 must agree)."""
+    h = datetime.now(timezone.utc).hour
+    in_window = MODEL1_WINDOW_UTC_HOURS[0] <= h < MODEL1_WINDOW_UTC_HOURS[1]
+    return await _detect_setup(client, name, symbol, "daily_crt", known_ids, in_window)
+
+
+async def check_model2(client: DerivClient, name: str, symbol: str, known_ids: set) -> Optional[dict]:
+    """Model 2: 4H CRT Continuation (spec 3.2). BOS on H4, LTFs M30 AND M15 must both agree."""
     now = datetime.now(timezone.utc)
     minutes_into_h4 = (now.hour % 4) * 60 + now.minute
-    if not (MODEL2_WINDOW_MINUTES_INTO_H4[0] <= minutes_into_h4 < MODEL2_WINDOW_MINUTES_INTO_H4[1]):
-        return None
-    h4 = await client.get_candles(symbol, GRAN["H4"], count=10, drop_forming=False)
-    if len(h4) < 2:
-        log.debug("[%s] Model2: not enough H4 candles", symbol)
-        return None
-    candle1, candle2 = h4[-2], h4[-1]
-    direction = two_candle_bos(candle1, candle2)
-    if direction is None:
-        log.info("[%s] Model2: no 2-candle H4 BOS (c1 H/L=%.5f/%.5f, c2 H/L=%.5f/%.5f)",
-                  symbol, candle1.high, candle1.low, candle2.high, candle2.low)
-        return None
-
-    m30 = await client.get_candles(symbol, GRAN["M30"])
-    m15 = await client.get_candles(symbol, GRAN["M15"])
-    flow30, flow15 = compute_orderflow(m30), compute_orderflow(m15)
-    if not (flow30 == direction and flow15 == direction):
-        log.info("[%s] Model2: H4 BOS=%s but M30=%s/M15=%s don't both agree — invalidated",
-                  symbol, direction, flow30, flow15)
-        return {"verdict": "invalidated", "model": "4h_crt"}
-
-    pois30 = [p for p in gather_pois(m30[-POI_LOOKBACK_CANDLES:], "M30") if p["direction"] == direction]
-    pois15 = [p for p in gather_pois(m15[-POI_LOOKBACK_CANDLES:], "M15") if p["direction"] == direction]
-    merged = merge_confluence(pois30, pois15)
-    merged = cap_nearest_per_type(merged, m15[-1].close)
-    if not merged:
-        log.info("[%s] Model2: H4 BOS=%s, M30/M15 agree, but no matching unmitigated POI found",
-                  symbol, direction)
-    else:
-        log.info("[%s] Model2: CONFIRMED %s bias, %d matching POI(s) found", symbol, direction, len(merged))
-    invalidation = candle2.low if direction == "bullish" else candle2.high
-    return {"verdict": direction, "model": "4h_crt", "symbol": symbol,
-            "bos_candle1": candle1, "bos_candle2": candle2,
-            "ltf_flows": {"M30": flow30, "M15": flow15},
-            "pois": merged, "invalidation": invalidation}
+    in_window = MODEL2_WINDOW_MINUTES_INTO_H4[0] <= minutes_into_h4 < MODEL2_WINDOW_MINUTES_INTO_H4[1]
+    return await _detect_setup(client, name, symbol, "4h_crt", known_ids, in_window)
 
 
 # ---------------------------------------------------------------------------
@@ -751,15 +965,20 @@ def dedup_key(symbol: str, model: str, poi: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# State persistence
+# State persistence (dedup keys, cooldowns, AND active setups)
 # ---------------------------------------------------------------------------
 
 def load_state() -> dict:
+    state: dict = {}
     try:
         with open(STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
     except Exception:
-        return {"fired_keys": [], "cooldowns": {}}
+        pass
+    state.setdefault("fired_keys", [])
+    state.setdefault("cooldowns", {})
+    state.setdefault("active_setups", {})
+    return state
 
 
 def save_state(state: dict):
@@ -800,7 +1019,9 @@ message of AT MOST 120 words with exactly these three sections:
 1. Bias Verdict (must exactly match payload['verdict'] — do not change it)
 2. Key Levels to Watch (ONLY levels/POIs present in the payload — never mention any
    level, POI type, or concept that is not explicitly in this payload)
-3. Risk / Invalidation Note (use payload['invalidation'] as the exact level)
+3. Risk / Invalidation Note (use payload['invalidation'] as the exact level and
+   payload['invalidation_rule'] as the rule)
+Do NOT restate the checklist or the candle-1 range — they are displayed separately.
 
 PAYLOAD:
 {json.dumps(payload, default=str)}
@@ -848,20 +1069,40 @@ class Notifier:
     async def send(self, text: str):
         try:
             await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=ParseMode.HTML)
+            return
         except Exception as exc:  # noqa: BLE001
-            log.error("Telegram send failed: %s", exc)
+            log.error("Telegram send failed (HTML): %s — retrying as plain text", exc)
+        # An alert must never be lost to a formatting problem: retry without HTML.
+        try:
+            plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+            await self.bot.send_message(chat_id=self.chat_id, text=plain)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Telegram send failed (plain): %s", exc)
 
 
-def format_alert(symbol: str, payload: dict, ai_text: str) -> str:
+def format_alert(setup: dict, payload: dict, ai_text: str, checklist: list[tuple[str, bool]]) -> str:
     poi = payload["poi"]
     level_str = poi.get("level")
-    if level_str is None:
-        level_str = f'{poi["zone_low"]}–{poi["zone_high"]}'
-    return (
-        f"🎯 <b>{symbol}</b> — {payload['model'].replace('_', ' ').title()}\n"
-        f"<b>Triggered POI:</b> {poi['type'].replace('_', ' ').title()} ({poi['timeframe']}) @ {level_str}\n\n"
-        f"{ai_text}"
-    )
+    level_str = fmt_price(level_str) if level_str is not None else \
+        f'{fmt_price(poi["zone_low"])}–{fmt_price(poi["zone_high"])}'
+    d = setup["direction"]
+    c1 = setup["c1"]
+    score = sum(1 for _, ok in checklist if ok)
+    c2_day = datetime.fromtimestamp(setup["c2"]["epoch"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    def esc(s: str) -> str:
+        return html.escape(s, quote=False)  # only <, >, & matter inside Telegram HTML text
+    lines = [
+        f"🎯 <b>{esc(setup['name'])}</b> — {MODEL_TITLES[setup['model']]} ({d.upper()})",
+        f"<b>Triggered POI:</b> {poi['type'].replace('_', ' ').title()} ({poi['timeframe']}) @ {level_str}",
+        f"<b>Dealing range (candle 1):</b> {fmt_price(c1['low'])} – {fmt_price(c1['high'])}",
+        f"<b>Invalidation:</b> close {'below' if d == 'bullish' else 'above'} {fmt_price(setup['invalidation'])}",
+        f"<i>Setup candle 2: {c2_day}</i>",
+        "",
+        f"<b>Checklist {score}/{len(checklist)}</b>",
+    ]
+    lines += [f"{'✅' if ok else '❌'} {esc(label)}" for label, ok in checklist]
+    lines += ["", esc(ai_text)]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -873,12 +1114,18 @@ class AlertEngine:
         self.client = DerivClient(DERIV_WS_URL)
         self.notifier = Notifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.state = load_state()
+        self._poi_cache: dict[str, tuple] = {}
 
     async def start(self):
         await self._connect_with_retry()
         await self.client.load_symbol_map(TARGET_ASSETS)
-        await self.notifier.send(f"✅ CRT alert bot online. Watching {len(self.client.symbol_map)} assets "
-                                  f"(ALERT_MODE={ALERT_MODE}).")
+        self._prune_expired()
+        restored = len(self.state["active_setups"])
+        await self.notifier.send(
+            f"✅ CRT alert bot online. Watching {len(self.client.symbol_map)} assets "
+            f"(ALERT_MODE={ALERT_MODE}, POI family={POI_FAMILY}, dealing range={DEALING_RANGE_MODE}, "
+            f"invalidation={INVALIDATION_MODE}, min checklist={MIN_CHECKLIST_SCORE}). "
+            f"Active setups restored: {restored}.")
         asyncio.create_task(self._heartbeat_loop())
         await self._poll_loop()
 
@@ -904,67 +1151,203 @@ class AlertEngine:
     async def _heartbeat_loop(self):
         while True:
             await asyncio.sleep(24 * 3600)
-            await self.notifier.send("💓 CRT alert bot heartbeat — still running.")
+            await self.notifier.send(
+                f"💓 CRT alert bot heartbeat — still running. Active setups: {len(self.state['active_setups'])}.")
 
     async def _poll_loop(self):
         while True:
             try:
                 await self._ensure_connected()
                 await self.client.keepalive()
+                self._prune_expired()
                 for name, symbol in list(self.client.symbol_map.items()):
                     await self._scan_symbol(name, symbol)
-                    await asyncio.sleep(0.2)  # spread requests within Deriv's rate budget
+                    await asyncio.sleep(0.3)  # spread requests within Deriv's rate budget
             except Exception as exc:  # noqa: BLE001
                 log.error("Poll loop error: %s", exc)
                 await asyncio.sleep(5)
             await asyncio.sleep(POLL_SECONDS)
 
+    def _prune_expired(self):
+        now = time.time()
+        expired = [sid for sid, s in self.state["active_setups"].items() if now >= s["valid_until"]]
+        for sid in expired:
+            log.info("Setup expired (third candle over): %s", sid)
+            self._drop_setup(sid)
+        if expired:
+            save_state(self.state)
+
+    def _drop_setup(self, setup_id: str):
+        self.state["active_setups"].pop(setup_id, None)
+        self._poi_cache.pop(setup_id, None)
+
     async def _scan_symbol(self, name: str, symbol: str):
+        # 1) Find/confirm new setups (cheap: candles are cached until a new candle closes).
+        known = set(self.state["active_setups"].keys())
         for check in (check_model1, check_model2):
             try:
-                result = await check(self.client, symbol)
+                setup = await check(self.client, name, symbol, known)
             except Exception as exc:  # noqa: BLE001
                 log.error("%s failed for %s: %s", check.__name__, name, exc)
+                if "RateLimit" in str(exc) or "rate" in str(exc).lower():
+                    await asyncio.sleep(10)
                 continue
-            if result is None or result["verdict"] == "invalidated" or not result.get("pois"):
-                continue
+            if setup:
+                self.state["active_setups"][setup["id"]] = setup
+                known.add(setup["id"])
+                save_state(self.state)
+                log.info("[%s] SETUP REGISTERED %s %s | candle1 %s–%s | invalidation %s | live until %s UTC",
+                         name, setup["model"], setup["direction"].upper(),
+                         fmt_price(setup["c1"]["low"]), fmt_price(setup["c1"]["high"]),
+                         fmt_price(setup["invalidation"]),
+                         datetime.fromtimestamp(setup["valid_until"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        # 2) Watch every live setup for this symbol — at ANY time, not just in a window.
+        await self._monitor_symbol(name, symbol)
 
-            model_key = f'{name}|{result["model"]}'
-            cooldown_until = self.state["cooldowns"].get(model_key, 0)
-            if time.time() < cooldown_until:
-                continue
+    def _setup_pois(self, setup: dict, ltf: dict) -> list[dict]:
+        """POIs for a live setup: direction-matched, inside candle 1's dealing range,
+        capped to the nearest per type. Cached until an LTF candle closes."""
+        sig = tuple(c[-1].epoch if c else 0 for c in ltf.values())
+        cached = self._poi_cache.get(setup["id"])
+        if cached and cached[0] == sig:
+            return cached[1]
+        direction = setup["direction"]
+        c1_low, c1_high = setup["c1"]["low"], setup["c1"]["high"]
+        per_tf = {tf: [p for p in gather_pois(candles[-POI_LOOKBACK_CANDLES:], tf)
+                       if p["direction"] == direction] for tf, candles in ltf.items()}
+        if setup["model"] == "4h_crt":
+            pois = merge_confluence(per_tf.get("M30", []), per_tf.get("M15", []))
+        else:
+            pois = [p for tf in ltf for p in per_tf[tf]]
+        total = len(pois)
+        pois = [p for p in pois if poi_in_dealing_range(p, direction, c1_low, c1_high)]
+        in_range = len(pois)
+        ref_close = ltf[setup["ref_tf"]][-1].close
+        pois = cap_nearest_per_type(pois, ref_close)
+        counts: dict[str, int] = {}
+        for p in pois:
+            counts[p["type"]] = counts.get(p["type"], 0) + 1
+        log_change(f"poi:{setup['id']}",
+                   "[%s] %s %s: %d POI(s) in direction, %d inside candle-1 dealing range (%s), kept %d: %s",
+                   setup["name"], setup["model"], direction, total, in_range, DEALING_RANGE_MODE,
+                   len(pois), counts or "none")
+        self._poi_cache[setup["id"]] = (sig, pois)
+        return pois
 
+    async def _monitor_symbol(self, name: str, symbol: str):
+        setups = [s for s in list(self.state["active_setups"].values()) if s["name"] == name]
+        if not setups:
+            return
+        m1s: Optional[list[Candle]] = None
+        for setup in setups:
+            model = setup["model"]
             try:
-                m1 = await self.client.get_candles(symbol, GRAN["M1"], count=2)
+                ltf = {tf: await self.client.get_candles_cached(symbol, GRAN[tf]) for tf in MODEL_LTFS[model]}
             except Exception as exc:  # noqa: BLE001
-                log.error("Failed to fetch M1 for %s: %s", name, exc)
+                log.error("[%s] LTF fetch failed for %s: %s", name, model, exc)
                 continue
-            if not m1:
+            if any(not c for c in ltf.values()):
                 continue
-            latest_m1 = m1[-1]
 
-            for poi in result["pois"]:
-                if not alert_condition_met(latest_m1, poi):
-                    continue
-                key = dedup_key(name, result["model"], poi)
+            # Invalidation: a CLOSE of the reference LTF beyond the level (candle 1's far extreme by default).
+            ref_close = ltf[setup["ref_tf"]][-1].close
+            if is_invalidated(ref_close, setup["direction"], setup["invalidation"]):
+                log.info("[%s] SETUP INVALIDATED %s %s: %s closed at %s, %s the level %s",
+                         name, model, setup["direction"], setup["ref_tf"], fmt_price(ref_close),
+                         "below" if setup["direction"] == "bullish" else "above",
+                         fmt_price(setup["invalidation"]))
+                if setup.get("alerted"):
+                    await self.notifier.send(
+                        f"⚠️ <b>{html.escape(name, quote=False)}</b> — {MODEL_TITLES[model]} "
+                        f"{setup['direction']} setup INVALIDATED ({setup['ref_tf']} closed "
+                        f"{'below' if setup['direction'] == 'bullish' else 'above'} {fmt_price(setup['invalidation'])}).")
+                self._drop_setup(setup["id"])
+                save_state(self.state)
+                continue
+
+            # LTF orderflow must STILL agree, otherwise pause (it may recover).
+            flows = {tf: compute_orderflow(c) for tf, c in ltf.items()}
+            agree = sum(1 for f in flows.values() if f == setup["direction"])
+            if agree < MODEL_LTFS_REQUIRED[model]:
+                log_change(f"flow:{setup['id']}", "[%s] %s paused: only %d/%d LTFs agree now (%s)",
+                           name, model, agree, len(flows), " ".join(f"{k}={v}" for k, v in flows.items()))
+                continue
+            log_change(f"flow:{setup['id']}", "[%s] %s active: LTFs agree (%s)",
+                       name, model, " ".join(f"{k}={v}" for k, v in flows.items()))
+
+            pois = self._setup_pois(setup, ltf)
+            if not pois:
+                continue
+
+            model_key = f"{name}|{model}"
+            if time.time() < self.state["cooldowns"].get(model_key, 0):
+                continue
+
+            if m1s is None:
+                try:
+                    m1s = await self.client.get_candles(symbol, GRAN["M1"], count=3)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("[%s] Failed to fetch M1: %s", name, exc)
+                    return
+            if not m1s:
+                continue
+
+            candidates = []
+            for poi in pois:
+                if POI_FAMILY == "ictsmc" and poi["type"] not in ICT_SMC_POIS:
+                    continue  # MSNR levels still count as confluence, but can't trigger on their own
+                key = dedup_key(name, model, poi)
                 if key in self.state["fired_keys"]:
                     continue
+                for m1 in m1s[-2:]:  # last two closed M1 candles, so a slow loop can't miss a touch
+                    if alert_condition_met(m1, poi):
+                        others = [p for p in pois if p is not poi]
+                        checklist = build_checklist(setup, poi, others, flows, m1)
+                        score = sum(1 for _, ok in checklist if ok)
+                        if score >= MIN_CHECKLIST_SCORE:
+                            candidates.append((poi, m1, key, checklist, score))
+                        else:
+                            log_change(f"low:{key}", "[%s] %s touch on %s suppressed: checklist %d/%d < MIN_CHECKLIST_SCORE=%d",
+                                       name, model, poi["type"], score, len(checklist), MIN_CHECKLIST_SCORE)
+                        break
+            if not candidates:
+                continue
+            # Best first: highest-grade POI type, then highest checklist score.
+            candidates.sort(key=lambda t: (poi_priority(t[0]), -t[4]))
+            poi, m1, key, checklist, score = candidates[0]
 
-                other = [p for p in result["pois"] if p is not poi][:5]
-                payload = {
-                    "symbol": name, "model": result["model"], "verdict": result["verdict"],
-                    "bos_candle1": result["bos_candle1"], "bos_candle2": result["bos_candle2"],
-                    "ltf_flows": result["ltf_flows"], "poi": poi, "other_pois": other,
-                    "invalidation": result["invalidation"],
-                }
-                ai_text = await call_ai_narration(payload)
-                await self.notifier.send(format_alert(name, payload, ai_text))
+            others = sorted((p for p in pois if p is not poi),
+                            key=lambda p: abs(sum(poi_bounds(p)) / 2 - ref_close))[:5]
+            c1 = setup["c1"]
+            payload = {
+                "symbol": name, "model": model, "verdict": setup["direction"],
+                "candle1_range": {"high": c1["high"], "low": c1["low"],
+                                  "equilibrium": (c1["high"] + c1["low"]) / 2},
+                "ltf_flows": flows, "poi": poi, "other_pois": others,
+                "invalidation": setup["invalidation"],
+                "invalidation_rule": f"a {setup['ref_tf']} close "
+                                     f"{'below' if setup['direction'] == 'bullish' else 'above'} this level",
+            }
+            ai_text = await call_ai_narration(payload)
+            await self.notifier.send(format_alert(setup, payload, ai_text, checklist))
 
-                self.state["fired_keys"].append(key)
-                self.state["fired_keys"] = self.state["fired_keys"][-5000:]  # cap growth
-                self.state["cooldowns"][model_key] = time.time() + COOLDOWN_MINUTES * 60
-                save_state(self.state)
-                break  # one alert per model per scan is enough; cooldown handles the rest
+            setup["alerted"] = True
+            self.state["fired_keys"].append(key)
+            self.state["fired_keys"] = self.state["fired_keys"][-5000:]  # cap growth
+            self.state["cooldowns"][model_key] = time.time() + COOLDOWN_MINUTES * 60
+            save_state(self.state)
+            log.info("[%s] ALERT SENT %s %s %s checklist %d/%d", name, model, setup["direction"],
+                     poi["type"], score, len(checklist))
+            # One machine-readable line per alert. Search the logs for ALERT_RECORD to collect
+            # them, then compare outcomes by POI type — that is how to find out which concepts
+            # actually perform better, rather than assuming.
+            log.info("ALERT_RECORD %s", json.dumps({
+                "ts": int(time.time()), "symbol": name, "model": model, "direction": setup["direction"],
+                "poi_type": poi["type"], "poi_family": "ictsmc" if poi["type"] in ICT_SMC_POIS else "msnr",
+                "poi_tf": poi["timeframe"], "poi_low": poi_bounds(poi)[0], "poi_high": poi_bounds(poi)[1],
+                "checklist": f"{score}/{len(checklist)}", "c1_low": c1["low"], "c1_high": c1["high"],
+                "invalidation": setup["invalidation"], "c2_epoch": setup["c2"]["epoch"],
+                "trigger_m1_close": m1.close}))
 
 
 async def main():
