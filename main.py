@@ -39,6 +39,8 @@ financial advice.
 import asyncio
 import html
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
 import os
 import re
@@ -1350,7 +1352,35 @@ class AlertEngine:
                 "trigger_m1_close": m1.close}))
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Answers ANY request with 200 OK. Exists ONLY to satisfy a hosting platform's
+    health check (e.g. Back4App expects something listening on $PORT, or it marks
+    the deploy 'failed' even though the bot itself is running correctly — this
+    bot has no web UI and never needs more than this). Never touches bot logic."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):
+        pass  # don't spam the real logs with health-check hits
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except OSError as exc:
+        log.warning("Could not bind health-check port %d (%s) — skipping it. "
+                    "Fine on platforms that don't require one.", port, exc)
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health-check HTTP server listening on 0.0.0.0:%d (not used for any bot logic)", port)
+
+
 async def main():
+    start_health_server()
     engine = AlertEngine()
     while True:
         try:
