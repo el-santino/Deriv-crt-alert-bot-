@@ -22,7 +22,9 @@ are first spotted early. Candle 1 is the dealing range (a POI must form inside i
 far extreme is the invalidation level: an LTF close beyond it kills the setup. Every alert
 carries a code-computed confluence checklist. Active setups are saved to STATE_PATH.
 Only ICT/SMC POIs trigger alerts by default (POI_FAMILY=ictsmc); MSNR levels still count
-as confluence. POIs must form INSIDE candle 1's range; there is no premium/discount rule.
+as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=4 so only
+high-probability setups (4/5 or 5/5 checklist) are sent. POIs must form INSIDE candle 1's
+range; there is no premium/discount rule.
 
 HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG/BPR, Order/
 Propulsion/Breaker/Mitigation/Rejection Blocks, A/V Level, QML) are
@@ -90,7 +92,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
 
 DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # public data, no app_id/auth needed
 
-ALERT_MODE = os.environ.get("ALERT_MODE", "touch").strip().lower()  # "touch" or "reaction"
+ALERT_MODE = os.environ.get("ALERT_MODE", "reaction").strip().lower()  # "touch" or "reaction" — default "reaction" for higher-probability rejections
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
 STATE_PATH = os.environ.get("STATE_PATH", "./state.json").strip()
@@ -124,7 +126,9 @@ GRAN = {"M1": 60, "M15": 900, "M30": 1800, "H1": 3600, "H2": 7200, "H4": 14400, 
 
 SWING_N = 3            # fractal: a swing point is the extreme of 2*N+1 confirmed candles
 ATR_PERIOD = 14
-DISPLACEMENT_ATR_MULT = 1.5
+# Slightly relaxed from 1.5 → 1.3 so Order Blocks / Breakers / Propulsion appear more often
+# (previously only BPR was reliably triggering). Quality is still protected by MIN_CHECKLIST_SCORE=4.
+DISPLACEMENT_ATR_MULT = 1.3
 LONG_WICK_BODY_MULT = 2
 LONG_WICK_ATR_MULT = 1
 MODEL1_WINDOW_UTC_HOURS = (16, 24)   # evaluate Model 1 setup only in this UTC hour range
@@ -170,17 +174,19 @@ def _choice(env_name: str, default: str, allowed: tuple) -> str:
 #    There is deliberately NO premium/discount rule.
 INVALIDATION_MODE = _choice("INVALIDATION_MODE", "candle1", ("candle1", "candle1_eq", "candle2"))
 DEALING_RANGE_MODE = _choice("DEALING_RANGE_MODE", "inside", ("inside", "overlap", "off"))
-# Alerts below this checklist score (out of 5) are suppressed. 0 = show the checklist
-# but never suppress. Raise it (e.g. 3 or 4) once you've seen typical scores.
-MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "0"))
+# Alerts below this checklist score (out of 5) are suppressed.
+# Default raised to 4 so only high-probability setups (4/5 or 5/5) are sent.
+MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "4"))
 
 # POI families.
+# ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
+# and still count as confluence on the checklist, but they can NEVER fire an alert
+# by themselves when POI_FAMILY=ictsmc (the recommended default).
 ICT_SMC_POIS = {"fvg", "ifvg", "bpr", "order_block", "propulsion_block",
                 "breaker_block", "mitigation_block", "rejection_block"}
 MSNR_POIS = {"a_level", "v_level", "qml", "qmc"}
-# POI_FAMILY: "ictsmc" (default) = only ICT/SMC POIs can TRIGGER an alert. MSNR levels are
-# still detected and still count as confluence on the checklist, they just can't fire an
-# alert on their own. "all" = MSNR levels can trigger alerts too.
+# POI_FAMILY: "ictsmc" (default) = only ICT/SMC POIs can TRIGGER an alert.
+# MSNR levels still count as confluence. "all" = MSNR can also trigger (not recommended).
 POI_FAMILY = _choice("POI_FAMILY", "ictsmc", ("ictsmc", "all"))
 
 # When several POIs are touched at once, the highest-priority (lowest number) is alerted.
@@ -381,7 +387,7 @@ def lower_wick(c: Candle) -> float:
 
 
 def is_displacement(candle: Candle, candles_up_to_here: list[Candle]) -> bool:
-    """DISPLACEMENT = candle body >= 1.5x ATR(14) AND it closes beyond the prior swing point.
+    """DISPLACEMENT = candle body >= DISPLACEMENT_ATR_MULT × ATR(14) AND it closes beyond the prior swing point.
     (The 'closes beyond a swing point' half is checked by each caller, which already
     has the relevant swing list in scope; this function checks the ATR half.)"""
     a = atr(candles_up_to_here)
