@@ -48,7 +48,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -959,6 +959,7 @@ def load_state() -> dict:
     state.setdefault("fired_keys", [])
     state.setdefault("cooldowns", {})
     state.setdefault("active_setups", {})
+    state.setdefault("alert_history", [])  # compact records for daily summary
     return state
 
 
@@ -1107,7 +1108,9 @@ class AlertEngine:
             f"(ALERT_MODE={ALERT_MODE}, POI family={POI_FAMILY}, dealing range={DEALING_RANGE_MODE}, "
             f"invalidation={INVALIDATION_MODE}, min checklist={MIN_CHECKLIST_SCORE}). "
             f"Active setups restored: {restored}.")
-        asyncio.create_task(self._heartbeat_loop())
+        # Send a performance summary immediately on startup (if any history exists)
+        await self._send_daily_summary(title="Startup Summary")
+        asyncio.create_task(self._daily_summary_loop())
         await self._poll_loop()
 
     async def _connect_with_retry(self):
@@ -1129,11 +1132,75 @@ class AlertEngine:
             log.warning("Reconnecting to Deriv...")
             await self._connect_with_retry()
 
-    async def _heartbeat_loop(self):
+    def _seconds_until_next_7am_wat(self) -> float:
+        """Seconds until the next 07:00 Africa/Lagos (WAT = UTC+1)."""
+        now = datetime.now(ZoneInfo("Africa/Lagos"))
+        target = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now >= target:
+            # already past 7am today → schedule for tomorrow
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
+
+    async def _daily_summary_loop(self):
+        """Send performance summary every day at 07:00 WAT."""
         while True:
-            await asyncio.sleep(24 * 3600)
+            wait = self._seconds_until_next_7am_wat()
+            log.info("Next daily summary in %.1f hours (07:00 WAT)", wait / 3600)
+            await asyncio.sleep(wait)
+            await self._send_daily_summary(title="Daily Summary (07:00 WAT)")
+
+    async def _send_daily_summary(self, title: str = "Daily Summary"):
+        """Build and send a checklist / POI performance summary for the last 24h."""
+        history = self.state.get("alert_history", [])
+        now = time.time()
+        last_24h = [a for a in history if a["ts"] >= now - 24 * 3600]
+
+        active = len(self.state.get("active_setups", {}))
+
+        if not last_24h:
             await self.notifier.send(
-                f"💓 CRT alert bot heartbeat — still running. Active setups: {len(self.state['active_setups'])}.")
+                f"📊 <b>{title}</b>\n"
+                f"Last 24h: <b>0 alerts</b>\n"
+                f"Active setups right now: {active}\n"
+                f"Bot is running normally.")
+            return
+
+        # Score distribution
+        score_counts: dict[str, int] = {}
+        poi_counts: dict[str, int] = {}
+        symbol_counts: dict[str, int] = {}
+        direction_counts = {"bullish": 0, "bearish": 0}
+
+        for a in last_24h:
+            key = f"{a['score']}/{a['max_score']}"
+            score_counts[key] = score_counts.get(key, 0) + 1
+            poi_counts[a["poi_type"]] = poi_counts.get(a["poi_type"], 0) + 1
+            symbol_counts[a["symbol"]] = symbol_counts.get(a["symbol"], 0) + 1
+            direction_counts[a["direction"]] = direction_counts.get(a["direction"], 0) + 1
+
+        # Sort helpers
+        score_lines = "\n".join(
+            f"• {k}: {v}" for k, v in sorted(score_counts.items(), reverse=True)
+        )
+        poi_lines = "\n".join(
+            f"• {k.replace('_', ' ').title()}: {v}"
+            for k, v in sorted(poi_counts.items(), key=lambda x: -x[1])
+        )
+        top_symbols = sorted(symbol_counts.items(), key=lambda x: -x[1])[:8]
+        symbol_lines = "\n".join(f"• {s}: {c}" for s, c in top_symbols)
+
+        text = (
+            f"📊 <b>{title}</b>\n"
+            f"<i>Last 24 hours</i>\n\n"
+            f"<b>Total alerts:</b> {len(last_24h)}\n"
+            f"<b>Bullish / Bearish:</b> {direction_counts['bullish']} / {direction_counts['bearish']}\n\n"
+            f"<b>Checklist scores</b>\n{score_lines}\n\n"
+            f"<b>By POI type</b>\n{poi_lines}\n\n"
+            f"<b>Top symbols</b>\n{symbol_lines}\n\n"
+            f"Active setups right now: {active}"
+        )
+        await self.notifier.send(text)
+        log.info("%s sent — %d alerts in last 24h", title, len(last_24h))
 
     async def _poll_loop(self):
         while True:
@@ -1316,6 +1383,21 @@ class AlertEngine:
             self.state["fired_keys"].append(key)
             self.state["fired_keys"] = self.state["fired_keys"][-5000:]  # cap growth
             self.state["cooldowns"][model_key] = time.time() + COOLDOWN_MINUTES * 60
+
+            # Record for daily performance summary
+            self.state.setdefault("alert_history", []).append({
+                "ts": int(time.time()),
+                "symbol": name,
+                "model": model,
+                "direction": setup["direction"],
+                "poi_type": poi["type"],
+                "score": score,
+                "max_score": len(checklist),
+            })
+            # Keep only last 7 days of history to avoid unbounded growth
+            cutoff = time.time() - 7 * 24 * 3600
+            self.state["alert_history"] = [a for a in self.state["alert_history"] if a["ts"] >= cutoff]
+
             save_state(self.state)
             log.info("[%s] ALERT SENT %s %s %s checklist %d/%d", name, model, setup["direction"],
                      poi["type"], score, len(checklist))
