@@ -26,7 +26,7 @@ as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=4 so onl
 high-probability setups (4/5 or 5/5 checklist) are sent. POIs must form INSIDE candle 1's
 range; there is no premium/discount rule.
 
-HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG/BPR, Order/
+HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG, Order/
 Propulsion/Breaker/Mitigation/Rejection Blocks, A/V Level, QML) are
 deterministic, rule-based implementations of the definitions given for this
 build. They are a good-faith, code-exact match to those definitions, not a
@@ -126,8 +126,8 @@ GRAN = {"M1": 60, "M15": 900, "M30": 1800, "H1": 3600, "H2": 7200, "H4": 14400, 
 
 SWING_N = 3            # fractal: a swing point is the extreme of 2*N+1 confirmed candles
 ATR_PERIOD = 14
-# Slightly relaxed from 1.5 → 1.3 so Order Blocks / Breakers / Propulsion appear more often
-# (previously only BPR was reliably triggering). Quality is still protected by MIN_CHECKLIST_SCORE=4.
+# Slightly relaxed from 1.5 → 1.3 so Order Blocks / Breakers / Propulsion appear more often.
+# Quality is still protected by MIN_CHECKLIST_SCORE=4.
 DISPLACEMENT_ATR_MULT = 1.3
 LONG_WICK_BODY_MULT = 2
 LONG_WICK_ATR_MULT = 1
@@ -182,7 +182,8 @@ MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "4"))
 # ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
 # and still count as confluence on the checklist, but they can NEVER fire an alert
 # by themselves when POI_FAMILY=ictsmc (the recommended default).
-ICT_SMC_POIS = {"fvg", "ifvg", "bpr", "order_block", "propulsion_block",
+# BPR completely removed — it was generating too many low-quality signals.
+ICT_SMC_POIS = {"fvg", "ifvg", "order_block", "propulsion_block",
                 "breaker_block", "mitigation_block", "rejection_block"}
 MSNR_POIS = {"a_level", "v_level", "qml", "qmc"}
 # POI_FAMILY: "ictsmc" (default) = only ICT/SMC POIs can TRIGGER an alert.
@@ -192,12 +193,12 @@ POI_FAMILY = _choice("POI_FAMILY", "ictsmc", ("ictsmc", "all"))
 # When several POIs are touched at once, the highest-priority (lowest number) is alerted.
 POI_PRIORITY = {
     "breaker_block": 0, "mitigation_block": 1, "order_block": 2, "propulsion_block": 3,
-    "ifvg": 4, "bpr": 5, "rejection_block": 6, "fvg": 7,
-    "qmc": 8, "qml": 9, "v_level": 10, "a_level": 10,
+    "ifvg": 4, "rejection_block": 5, "fvg": 6,
+    "qmc": 7, "qml": 8, "v_level": 9, "a_level": 9,
 }
 # ICT/SMC types that are NOT the plain FVG (the checklist treats these as "high-grade").
 HIGH_GRADE_POIS = {"order_block", "propulsion_block", "breaker_block", "mitigation_block",
-                   "ifvg", "bpr", "rejection_block"}
+                   "ifvg", "rejection_block"}
 
 # LTFs used by each model, which LTF's close decides invalidation, and how long a setup
 # stays live. A setup is live through the whole THIRD candle (candle 2 start + 2 candles).
@@ -474,33 +475,6 @@ def detect_ifvgs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
     return out
 
 
-def detect_bprs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
-    """BPR: a bullish FVG and a bearish FVG overlapping, formed within 10
-    candles of each other. Zone = the overlap. Can act as support OR
-    resistance depending which side price approaches from, so it is emitted
-    once per direction."""
-    out = []
-    idx_by_epoch = {c.epoch: i for i, c in enumerate(candles)}
-    bulls = [f for f in fvgs if f["direction"] == "bullish"]
-    bears = [f for f in fvgs if f["direction"] == "bearish"]
-    for b in bulls:
-        bi = idx_by_epoch.get(b["epoch"])
-        for s in bears:
-            si = idx_by_epoch.get(s["epoch"])
-            if bi is None or si is None or abs(bi - si) > 10:
-                continue
-            lo, hi = max(b["zone_low"], s["zone_low"]), min(b["zone_high"], s["zone_high"])
-            if lo < hi:
-                later = max(bi, si)
-                epoch = candles[later].epoch
-                armed = candles[min(later + 1, len(candles) - 1)].epoch
-                out.append({"type": "bpr", "direction": "bullish", "zone_low": lo, "zone_high": hi,
-                            "epoch": epoch, "armed_epoch": armed})
-                out.append({"type": "bpr", "direction": "bearish", "zone_low": lo, "zone_high": hi,
-                            "epoch": epoch, "armed_epoch": armed})
-    return out
-
-
 def detect_order_blocks(candles: list[Candle]) -> list[dict]:
     """Order Block: the last opposing-color candle before a DISPLACEMENT move
     that breaks the most recent swing point. Zone = that candle's full range
@@ -691,7 +665,7 @@ def detect_qmc(candles: list[Candle], qmls: list[dict]) -> list[dict]:
 
 def filter_unmitigated(pois: list[dict], candles: list[Candle]) -> list[dict]:
     """Keep only POIs price has NOT revisited since they finished forming.
-    - Zone POIs (FVG/IFVG/BPR/OB/Propulsion/Breaker/Mitigation): mitigated if any
+    - Zone POIs (FVG/IFVG/OB/Propulsion/Breaker/Mitigation): mitigated if any
       later candle's range overlaps the zone.
     - Level POIs (A/V Level, QML, QMC, Rejection Block): stale if any later
       candle's range contains the level.
@@ -726,7 +700,6 @@ def gather_pois(candles: list[Candle], timeframe: str) -> list[dict]:
     pois = (
         fvgs
         + detect_ifvgs(candles, fvgs)
-        + detect_bprs(candles, fvgs)
         + obs
         + detect_propulsion_blocks(obs)
         + breakers
