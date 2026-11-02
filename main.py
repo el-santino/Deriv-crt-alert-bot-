@@ -1165,11 +1165,12 @@ class AlertEngine:
                 f"Bot is running normally.")
             return
 
-        # Score distribution
+        # Score / POI / symbol / direction / outcome distribution
         score_counts: dict[str, int] = {}
         poi_counts: dict[str, int] = {}
         symbol_counts: dict[str, int] = {}
         direction_counts = {"bullish": 0, "bearish": 0}
+        outcome_counts = {"respected": 0, "invalidated": 0, "pending": 0}
 
         for a in last_24h:
             key = f"{a['score']}/{a['max_score']}"
@@ -1177,6 +1178,8 @@ class AlertEngine:
             poi_counts[a["poi_type"]] = poi_counts.get(a["poi_type"], 0) + 1
             symbol_counts[a["symbol"]] = symbol_counts.get(a["symbol"], 0) + 1
             direction_counts[a["direction"]] = direction_counts.get(a["direction"], 0) + 1
+            outcome = a.get("outcome", "pending")
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
 
         # Sort helpers
         score_lines = "\n".join(
@@ -1189,18 +1192,30 @@ class AlertEngine:
         top_symbols = sorted(symbol_counts.items(), key=lambda x: -x[1])[:8]
         symbol_lines = "\n".join(f"• {s}: {c}" for s, c in top_symbols)
 
+        respected = outcome_counts.get("respected", 0)
+        invalidated = outcome_counts.get("invalidated", 0)
+        pending = outcome_counts.get("pending", 0)
+        decided = respected + invalidated
+        win_rate = f"{(respected / decided * 100):.0f}%" if decided else "n/a"
+
         text = (
             f"📊 <b>{title}</b>\n"
             f"<i>Last 24 hours</i>\n\n"
             f"<b>Total alerts:</b> {len(last_24h)}\n"
             f"<b>Bullish / Bearish:</b> {direction_counts['bullish']} / {direction_counts['bearish']}\n\n"
+            f"<b>Outcome (bot analysis)</b>\n"
+            f"✅ Respected (held to expiry): {respected}\n"
+            f"❌ Invalidated (failed): {invalidated}\n"
+            f"⏳ Still pending: {pending}\n"
+            f"<b>Respect rate:</b> {win_rate} ({respected}/{decided} decided)\n\n"
             f"<b>Checklist scores</b>\n{score_lines}\n\n"
             f"<b>By POI type</b>\n{poi_lines}\n\n"
             f"<b>Top symbols</b>\n{symbol_lines}\n\n"
             f"Active setups right now: {active}"
         )
         await self.notifier.send(text)
-        log.info("%s sent — %d alerts in last 24h", title, len(last_24h))
+        log.info("%s sent — %d alerts in last 24h (respected=%d invalidated=%d pending=%d)",
+                 title, len(last_24h), respected, invalidated, pending)
 
     async def _poll_loop(self):
         while True:
@@ -1220,7 +1235,11 @@ class AlertEngine:
         now = time.time()
         expired = [sid for sid, s in self.state["active_setups"].items() if now >= s["valid_until"]]
         for sid in expired:
+            setup = self.state["active_setups"].get(sid)
             log.info("Setup expired (third candle over): %s", sid)
+            # If this setup was alerted and never invalidated → analysis held (respected)
+            if setup and setup.get("alerted"):
+                self._mark_outcome(sid, "respected")
             self._drop_setup(sid)
         if expired:
             save_state(self.state)
@@ -1228,6 +1247,14 @@ class AlertEngine:
     def _drop_setup(self, setup_id: str):
         self.state["active_setups"].pop(setup_id, None)
         self._poi_cache.pop(setup_id, None)
+
+    def _mark_outcome(self, setup_id: str, outcome: str):
+        """Update the outcome of an alerted setup in alert_history."""
+        for rec in self.state.get("alert_history", []):
+            if rec.get("setup_id") == setup_id and rec.get("outcome") == "pending":
+                rec["outcome"] = outcome
+                log.info("Outcome marked for %s → %s", setup_id, outcome)
+                break
 
     async def _scan_symbol(self, name: str, symbol: str):
         # 1) Find/confirm new setups (cheap: candles are cached until a new candle closes).
@@ -1305,6 +1332,7 @@ class AlertEngine:
                          "below" if setup["direction"] == "bullish" else "above",
                          fmt_price(setup["invalidation"]))
                 if setup.get("alerted"):
+                    self._mark_outcome(setup["id"], "invalidated")
                     await self.notifier.send(
                         f"⚠️ <b>{html.escape(name, quote=False)}</b> — {MODEL_TITLES[model]} "
                         f"{setup['direction']} setup INVALIDATED ({setup['ref_tf']} closed "
@@ -1384,15 +1412,17 @@ class AlertEngine:
             self.state["fired_keys"] = self.state["fired_keys"][-5000:]  # cap growth
             self.state["cooldowns"][model_key] = time.time() + COOLDOWN_MINUTES * 60
 
-            # Record for daily performance summary
+            # Record for daily performance summary (outcome starts as pending)
             self.state.setdefault("alert_history", []).append({
                 "ts": int(time.time()),
+                "setup_id": setup["id"],
                 "symbol": name,
                 "model": model,
                 "direction": setup["direction"],
                 "poi_type": poi["type"],
                 "score": score,
                 "max_score": len(checklist),
+                "outcome": "pending",  # later: "respected" or "invalidated"
             })
             # Keep only last 7 days of history to avoid unbounded growth
             cutoff = time.time() - 7 * 24 * 3600
