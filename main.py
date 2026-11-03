@@ -208,6 +208,10 @@ MODEL_REF_TF = {"daily_crt": "H1", "4h_crt": "M15"}   # close of this TF checks 
 MODEL_BOS_TF = {"daily_crt": "D1", "4h_crt": "H4"}
 MODEL_TITLES = {"daily_crt": "Daily CRT", "4h_crt": "4H CRT"}
 
+# Which models are active. Set to only Model 1 for higher-probability focus.
+# To re-enable Model 2 later, change to: ENABLED_MODELS = ("daily_crt", "4h_crt")
+ENABLED_MODELS = ("daily_crt",)  # Model 2 (4H CRT) currently paused
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -1102,11 +1106,21 @@ class AlertEngine:
         await self._connect_with_retry()
         await self.client.load_symbol_map(TARGET_ASSETS)
         self._prune_expired()
+        # Drop any setups from models that are currently disabled (e.g. Model 2 paused)
+        disabled = [sid for sid, s in self.state["active_setups"].items()
+                    if s.get("model") not in ENABLED_MODELS]
+        for sid in disabled:
+            log.info("Dropping setup from disabled model: %s", sid)
+            self._drop_setup(sid)
+        if disabled:
+            save_state(self.state)
         restored = len(self.state["active_setups"])
+        models_txt = ", ".join(MODEL_TITLES[m] for m in ENABLED_MODELS)
         await self.notifier.send(
             f"✅ CRT alert bot online. Watching {len(self.client.symbol_map)} assets "
-            f"(ALERT_MODE={ALERT_MODE}, POI family={POI_FAMILY}, dealing range={DEALING_RANGE_MODE}, "
-            f"invalidation={INVALIDATION_MODE}, min checklist={MIN_CHECKLIST_SCORE}). "
+            f"(Models: {models_txt} | ALERT_MODE={ALERT_MODE}, POI family={POI_FAMILY}, "
+            f"dealing range={DEALING_RANGE_MODE}, invalidation={INVALIDATION_MODE}, "
+            f"min checklist={MIN_CHECKLIST_SCORE}). "
             f"Active setups restored: {restored}.")
         # Send a performance summary immediately on startup (if any history exists)
         await self._send_daily_summary(title="Startup Summary")
@@ -1259,7 +1273,12 @@ class AlertEngine:
     async def _scan_symbol(self, name: str, symbol: str):
         # 1) Find/confirm new setups (cheap: candles are cached until a new candle closes).
         known = set(self.state["active_setups"].keys())
-        for check in (check_model1, check_model2):
+        checks = []
+        if "daily_crt" in ENABLED_MODELS:
+            checks.append(check_model1)
+        if "4h_crt" in ENABLED_MODELS:
+            checks.append(check_model2)
+        for check in checks:
             try:
                 setup = await check(self.client, name, symbol, known)
             except Exception as exc:  # noqa: BLE001
