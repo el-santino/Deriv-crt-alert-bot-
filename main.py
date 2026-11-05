@@ -93,7 +93,7 @@ if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_BOT_TOKEN):
 DERIV_WS_URL = "wss://api.derivws.com/trading/v1/options/ws/public"  # public data, no app_id/auth needed
 
 ALERT_MODE = os.environ.get("ALERT_MODE", "reaction").strip().lower()  # "touch" or "reaction" — default "reaction" for higher-probability rejections
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "50"))  # raised — Daily CRT doesn't need aggressive polling
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
 STATE_PATH = os.environ.get("STATE_PATH", "./state.json").strip()
 # Railway's filesystem is ephemeral — state (dedup keys, cooldowns) only survives
@@ -139,7 +139,7 @@ BOS_LOOKBACK_CANDLES = 100  # how far back to search for the most recent structu
 # let too many old, still-"unmitigated" POIs accumulate (seen: 35-49 matching POIs for a
 # single confirmed bias), which flooded Telegram with 10+ alerts at once. A much shorter
 # window keeps only genuinely recent, relevant levels.
-POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "60"))
+POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "40"))  # reduced from 60 — fewer stale POIs
 # Deriv meters ticks_history separately as "normal" vs "expensive" and the expensive
 # bucket is much tighter — a burst of 300-candle requests across 37 symbols right after
 # a cold start/restart was enough to exhaust it in under a second (seen in practice).
@@ -175,8 +175,9 @@ def _choice(env_name: str, default: str, allowed: tuple) -> str:
 INVALIDATION_MODE = _choice("INVALIDATION_MODE", "candle1", ("candle1", "candle1_eq", "candle2"))
 DEALING_RANGE_MODE = _choice("DEALING_RANGE_MODE", "inside", ("inside", "overlap", "off"))
 # Alerts below this checklist score (out of 5) are suppressed.
-# Default raised to 4 so only high-probability setups (4/5 or 5/5) are sent.
-MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "4"))
+# High-grade POI + multi-TF confluence are now mandatory filters (see alert logic),
+# so the numeric threshold is set to 3.
+MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "3"))
 
 # POI families.
 # ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
@@ -305,7 +306,10 @@ class DerivClient:
         if entry:
             candles, fetched_at = entry
             if drop_forming:
-                if candles and now < candles[-1].epoch + 2 * granularity + 2:
+                # More aggressive cache: reuse confirmed candles until the *next*
+                # candle after the last one is due to close (plus small buffer).
+                # Higher TFs (H1/H2/H4/D1) benefit the most — far fewer API calls.
+                if candles and now < candles[-1].epoch + granularity + max(30, granularity * 0.05):
                     return candles
             elif ttl is not None and now - fetched_at < ttl:
                 return candles
@@ -431,6 +435,81 @@ def compute_orderflow(candles: list[Candle], lookback: int = BOS_LOOKBACK_CANDLE
         if prior_lows and close < prior_lows[-1]:
             last_break = (i, "bearish")
     return last_break[1] if last_break else "neutral"
+
+
+def assess_irl_erl(candles: list[Candle], direction: str, c1_low: float, c1_high: float,
+                   flows: dict) -> dict:
+    """IRL / ERL confluence relative to the CRT bias and LTF orderflow.
+
+    ERL (External Range Liquidity) = swing highs/lows outside candle-1 dealing range.
+    IRL (Internal Range Liquidity) = structure/liquidity inside the dealing range.
+
+    Supportive logic (same direction as bias + LTF orderflow):
+      Bullish: sell-side ERL (external low) recently swept, price back inside range (IRL).
+      Bearish: buy-side ERL (external high) recently swept, price back inside range (IRL).
+
+    Returns a compact dict used as confluence context (not a checklist item).
+    Requires LTF orderflow to agree with the bias — otherwise marked weak.
+    """
+    ltf_agrees = all(f == direction for f in flows.values()) if flows else False
+    if len(candles) < SWING_N * 2 + 3:
+        return {
+            "aligned": False,
+            "ltf_agrees": ltf_agrees,
+            "erl_swept": False,
+            "poi_in_irl": True,  # dealing-range filter already enforces inside
+            "summary": "insufficient data for IRL/ERL",
+        }
+
+    highs, lows = find_swing_points(candles)
+    # External swings relative to candle-1 range
+    ext_highs = [(i, p) for i, p in highs if p > c1_high]
+    ext_lows = [(i, p) for i, p in lows if p < c1_low]
+
+    erl_swept = False
+    erl_level = None
+    erl_side = None
+
+    if direction == "bullish" and ext_lows:
+        # Look for a wick/sweep beyond the most recent external low, then close back above it
+        idx, level = ext_lows[-1]
+        for c in candles[idx + 1:]:
+            if c.low < level and c.close > level:
+                erl_swept = True
+                erl_level = level
+                erl_side = "sell-side ERL"
+                break
+    elif direction == "bearish" and ext_highs:
+        idx, level = ext_highs[-1]
+        for c in candles[idx + 1:]:
+            if c.high > level and c.close < level:
+                erl_swept = True
+                erl_level = level
+                erl_side = "buy-side ERL"
+                break
+
+    # POIs are already constrained inside candle 1 → treat as IRL by design
+    poi_in_irl = True
+    aligned = ltf_agrees and erl_swept and poi_in_irl
+
+    if aligned:
+        summary = f"Aligned: {erl_side} swept @ {fmt_price(erl_level)}, price in IRL, LTF orderflow {direction}"
+    elif ltf_agrees and not erl_swept:
+        summary = f"LTF orderflow {direction} agrees, but no clear supportive ERL sweep yet"
+    elif erl_swept and not ltf_agrees:
+        summary = f"{erl_side} swept @ {fmt_price(erl_level)}, but LTF orderflow does not fully agree"
+    else:
+        summary = "IRL/ERL not aligned with bias + LTF orderflow"
+
+    return {
+        "aligned": aligned,
+        "ltf_agrees": ltf_agrees,
+        "erl_swept": erl_swept,
+        "erl_side": erl_side,
+        "erl_level": erl_level,
+        "poi_in_irl": poi_in_irl,
+        "summary": summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1064,7 @@ def plain_template(payload: dict) -> str:
     poi_level = poi.get("level")
     if poi_level is None:
         poi_level = f'{poi["zone_low"]}-{poi["zone_high"]}'
+    irl = payload.get("irl_erl") or {}
     lines = [
         f"Bias Verdict: {payload['verdict'].title()}",
         "Key Levels to Watch:",
@@ -995,6 +1075,8 @@ def plain_template(payload: dict) -> str:
         if lvl is None:
             lvl = f'{p["zone_low"]}-{p["zone_high"]}'
         lines.append(f"  Also watch: {p['type']} ({p['timeframe']}) @ {lvl}")
+    if irl.get("summary"):
+        lines.append(f"IRL/ERL + orderflow: {irl['summary']}")
     lines.append(f"Risk/Invalidation Note: invalidated on a close beyond {payload['invalidation']}.")
     return "\n".join(lines)
 
@@ -1004,7 +1086,8 @@ async def call_ai_narration(payload: dict) -> str:
 message of AT MOST 120 words with exactly these three sections:
 1. Bias Verdict (must exactly match payload['verdict'] — do not change it)
 2. Key Levels to Watch (ONLY levels/POIs present in the payload — never mention any
-   level, POI type, or concept that is not explicitly in this payload)
+   level, POI type, or concept that is not explicitly in this payload). You may briefly
+   reference payload['irl_erl']['summary'] if present as supporting confluence.
 3. Risk / Invalidation Note (use payload['invalidation'] as the exact level and
    payload['invalidation_rule'] as the rule)
 Do NOT restate the checklist or the candle-1 range — they are displayed separately.
@@ -1077,11 +1160,14 @@ def format_alert(setup: dict, payload: dict, ai_text: str, checklist: list[tuple
     c2_day = datetime.fromtimestamp(setup["c2"]["epoch"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     def esc(s: str) -> str:
         return html.escape(s, quote=False)  # only <, >, & matter inside Telegram HTML text
+    irl = payload.get("irl_erl") or {}
+    irl_line = irl.get("summary") or "IRL/ERL not evaluated"
     lines = [
         f"🎯 <b>{esc(setup['name'])}</b> — {MODEL_TITLES[setup['model']]} ({d.upper()})",
         f"<b>Triggered POI:</b> {poi['type'].replace('_', ' ').title()} ({poi['timeframe']}) @ {level_str}",
         f"<b>Dealing range (candle 1):</b> {fmt_price(c1['low'])} – {fmt_price(c1['high'])}",
         f"<b>Invalidation:</b> close {'below' if d == 'bullish' else 'above'} {fmt_price(setup['invalidation'])}",
+        f"<b>IRL/ERL + LTF orderflow:</b> {esc(irl_line)}",
         f"<i>Setup candle 2: {c2_day}</i>",
         "",
         f"<b>Checklist {score}/{len(checklist)}</b>",
@@ -1232,14 +1318,21 @@ class AlertEngine:
                  title, len(last_24h), respected, invalidated, pending)
 
     async def _poll_loop(self):
+        scan_cycle = 0
         while True:
             try:
                 await self._ensure_connected()
                 await self.client.keepalive()
                 self._prune_expired()
+                active_names = {s["name"] for s in self.state["active_setups"].values()}
+                scan_cycle += 1
                 for name, symbol in list(self.client.symbol_map.items()):
-                    await self._scan_symbol(name, symbol)
-                    await asyncio.sleep(0.3)  # spread requests within Deriv's rate budget
+                    # Symbols with a live setup: always scan (monitor POIs + invalidation)
+                    # Symbols with no setup: only scan every 3rd cycle to discover new Daily CRT setups
+                    # (saves a large share of Deriv candle requests)
+                    if name in active_names or (scan_cycle % 3 == 0):
+                        await self._scan_symbol(name, symbol)
+                        await asyncio.sleep(0.25)
             except Exception as exc:  # noqa: BLE001
                 log.error("Poll loop error: %s", exc)
                 await asyncio.sleep(5)
@@ -1370,6 +1463,23 @@ class AlertEngine:
             log_change(f"flow:{setup['id']}", "[%s] %s active: LTFs agree (%s)",
                        name, model, " ".join(f"{k}={v}" for k, v in flows.items()))
 
+            # IRL/ERL confluence — must align in the same direction as LTF orderflow
+            ref_candles = ltf[setup["ref_tf"]]
+            irl_erl = assess_irl_erl(
+                ref_candles, setup["direction"],
+                setup["c1"]["low"], setup["c1"]["high"], flows)
+            if not irl_erl["ltf_agrees"]:
+                # Should rarely hit because of the agree check above; safety net
+                continue
+            # Require supportive ERL sweep in the bias direction (confluence with orderflow)
+            if not irl_erl["erl_swept"]:
+                log_change(f"irl:{setup['id']}",
+                           "[%s] %s paused: LTF orderflow agrees but no supportive ERL sweep yet (%s)",
+                           name, model, irl_erl["summary"])
+                continue
+            log_change(f"irl:{setup['id']}", "[%s] %s IRL/ERL confluence OK — %s",
+                       name, model, irl_erl["summary"])
+
             pois = self._setup_pois(setup, ltf)
             if not pois:
                 continue
@@ -1391,6 +1501,9 @@ class AlertEngine:
             for poi in pois:
                 if POI_FAMILY == "ictsmc" and poi["type"] not in ICT_SMC_POIS:
                     continue  # MSNR levels still count as confluence, but can't trigger on their own
+                # Hard filter: only high-grade ICT/SMC POIs may trigger (no plain FVG)
+                if poi["type"] not in HIGH_GRADE_POIS:
+                    continue
                 key = dedup_key(name, model, poi)
                 if key in self.state["fired_keys"]:
                     continue
@@ -1399,6 +1512,12 @@ class AlertEngine:
                         others = [p for p in pois if p is not poi]
                         checklist = build_checklist(setup, poi, others, flows, m1)
                         score = sum(1 for _, ok in checklist if ok)
+                        # Hard filter: multi-TF / stacked confluence must be true
+                        has_confluence = any(label.startswith("POI confluence") and ok for label, ok in checklist)
+                        if not has_confluence:
+                            log_change(f"noconf:{key}", "[%s] %s touch on %s suppressed: no multi-TF/stacked confluence",
+                                       name, model, poi["type"])
+                            break
                         if score >= MIN_CHECKLIST_SCORE:
                             candidates.append((poi, m1, key, checklist, score))
                         else:
@@ -1422,6 +1541,7 @@ class AlertEngine:
                 "invalidation": setup["invalidation"],
                 "invalidation_rule": f"a {setup['ref_tf']} close "
                                      f"{'below' if setup['direction'] == 'bullish' else 'above'} this level",
+                "irl_erl": irl_erl,
             }
             ai_text = await call_ai_narration(payload)
             await self.notifier.send(format_alert(setup, payload, ai_text, checklist))
