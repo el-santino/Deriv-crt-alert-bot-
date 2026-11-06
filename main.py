@@ -183,8 +183,8 @@ MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "3"))
 # ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
 # and still count as confluence on the checklist, but they can NEVER fire an alert
 # by themselves when POI_FAMILY=ictsmc (the recommended default).
-# BPR completely removed — it was generating too many low-quality signals.
-ICT_SMC_POIS = {"fvg", "ifvg", "order_block", "propulsion_block",
+# Plain FVG and BPR are allowed to trigger again (user requested).
+ICT_SMC_POIS = {"fvg", "ifvg", "bpr", "order_block", "propulsion_block",
                 "breaker_block", "mitigation_block", "rejection_block"}
 MSNR_POIS = {"a_level", "v_level", "qml", "qmc"}
 # POI_FAMILY: "ictsmc" (default) = only ICT/SMC POIs can TRIGGER an alert.
@@ -194,12 +194,12 @@ POI_FAMILY = _choice("POI_FAMILY", "ictsmc", ("ictsmc", "all"))
 # When several POIs are touched at once, the highest-priority (lowest number) is alerted.
 POI_PRIORITY = {
     "breaker_block": 0, "mitigation_block": 1, "order_block": 2, "propulsion_block": 3,
-    "ifvg": 4, "rejection_block": 5, "fvg": 6,
-    "qmc": 7, "qml": 8, "v_level": 9, "a_level": 9,
+    "ifvg": 4, "bpr": 5, "rejection_block": 6, "fvg": 7,
+    "qmc": 8, "qml": 9, "v_level": 10, "a_level": 10,
 }
-# ICT/SMC types that are NOT the plain FVG (the checklist treats these as "high-grade").
+# Kept for reference / future use only — no longer used as a filter or checklist item.
 HIGH_GRADE_POIS = {"order_block", "propulsion_block", "breaker_block", "mitigation_block",
-                   "ifvg", "rejection_block"}
+                   "ifvg", "bpr", "rejection_block"}
 
 # LTFs used by each model, which LTF's close decides invalidation, and how long a setup
 # stays live. A setup is live through the whole THIRD candle (candle 2 start + 2 candles).
@@ -558,6 +558,31 @@ def detect_ifvgs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
     return out
 
 
+def detect_bprs(candles: list[Candle], fvgs: list[dict]) -> list[dict]:
+    """BPR: a bullish FVG and a bearish FVG overlapping, formed within 10
+    candles of each other. Zone = the overlap. Emitted once per direction."""
+    out = []
+    idx_by_epoch = {c.epoch: i for i, c in enumerate(candles)}
+    bulls = [f for f in fvgs if f["direction"] == "bullish"]
+    bears = [f for f in fvgs if f["direction"] == "bearish"]
+    for b in bulls:
+        bi = idx_by_epoch.get(b["epoch"])
+        for s in bears:
+            si = idx_by_epoch.get(s["epoch"])
+            if bi is None or si is None or abs(bi - si) > 10:
+                continue
+            lo, hi = max(b["zone_low"], s["zone_low"]), min(b["zone_high"], s["zone_high"])
+            if lo < hi:
+                later = max(bi, si)
+                epoch = candles[later].epoch
+                armed = candles[min(later + 1, len(candles) - 1)].epoch
+                out.append({"type": "bpr", "direction": "bullish", "zone_low": lo, "zone_high": hi,
+                            "epoch": epoch, "armed_epoch": armed})
+                out.append({"type": "bpr", "direction": "bearish", "zone_low": lo, "zone_high": hi,
+                            "epoch": epoch, "armed_epoch": armed})
+    return out
+
+
 def detect_order_blocks(candles: list[Candle]) -> list[dict]:
     """Order Block: the last opposing-color candle before a DISPLACEMENT move
     that breaks the most recent swing point. Zone = that candle's full range
@@ -783,6 +808,7 @@ def gather_pois(candles: list[Candle], timeframe: str) -> list[dict]:
     pois = (
         fvgs
         + detect_ifvgs(candles, fvgs)
+        + detect_bprs(candles, fvgs)
         + obs
         + detect_propulsion_blocks(obs)
         + breakers
@@ -909,10 +935,10 @@ def build_checklist(setup: dict, poi: dict, other_pois: list[dict], flows: dict,
         and poi_bounds(o)[1] >= p_lo and poi_bounds(o)[0] <= p_hi
         for o in other_pois)
     reacted = (m1.close > p_hi) if d == "bullish" else (m1.close < p_lo)
+    # High-grade POI filter removed — FVG/BPR treated the same as other ICT/SMC POIs.
     return [
         (f"All LTFs agree with the {d} bias ({'/'.join(flows.keys())})", all(f == d for f in flows.values())),
         ("POI formed inside candle 1's range", p_lo >= c1_low and p_hi <= c1_high),
-        (f"ICT/SMC high-grade POI ({poi['type'].replace('_', ' ')})", poi["type"] in HIGH_GRADE_POIS),
         ("POI confluence (stacked POI or multi-timeframe)", stacked),
         ("M1 closed back out in the bias direction (rejection)", reacted),
     ]
@@ -1328,9 +1354,8 @@ class AlertEngine:
                 scan_cycle += 1
                 for name, symbol in list(self.client.symbol_map.items()):
                     # Symbols with a live setup: always scan (monitor POIs + invalidation)
-                    # Symbols with no setup: only scan every 3rd cycle to discover new Daily CRT setups
-                    # (saves a large share of Deriv candle requests)
-                    if name in active_names or (scan_cycle % 3 == 0):
+                    # Symbols with no setup: scan every 2nd cycle to discover new Daily CRT setups
+                    if name in active_names or (scan_cycle % 2 == 0):
                         await self._scan_symbol(name, symbol)
                         await asyncio.sleep(0.25)
             except Exception as exc:  # noqa: BLE001
@@ -1463,21 +1488,16 @@ class AlertEngine:
             log_change(f"flow:{setup['id']}", "[%s] %s active: LTFs agree (%s)",
                        name, model, " ".join(f"{k}={v}" for k, v in flows.items()))
 
-            # IRL/ERL confluence — must align in the same direction as LTF orderflow
+            # IRL/ERL confluence with LTF orderflow (same direction).
+            # ERL sweep is supportive context shown on the alert — NOT a hard gate.
+            # Requiring erl_swept blocked almost all Daily CRT alerts in practice.
             ref_candles = ltf[setup["ref_tf"]]
             irl_erl = assess_irl_erl(
                 ref_candles, setup["direction"],
                 setup["c1"]["low"], setup["c1"]["high"], flows)
             if not irl_erl["ltf_agrees"]:
-                # Should rarely hit because of the agree check above; safety net
                 continue
-            # Require supportive ERL sweep in the bias direction (confluence with orderflow)
-            if not irl_erl["erl_swept"]:
-                log_change(f"irl:{setup['id']}",
-                           "[%s] %s paused: LTF orderflow agrees but no supportive ERL sweep yet (%s)",
-                           name, model, irl_erl["summary"])
-                continue
-            log_change(f"irl:{setup['id']}", "[%s] %s IRL/ERL confluence OK — %s",
+            log_change(f"irl:{setup['id']}", "[%s] %s IRL/ERL — %s",
                        name, model, irl_erl["summary"])
 
             pois = self._setup_pois(setup, ltf)
@@ -1501,9 +1521,6 @@ class AlertEngine:
             for poi in pois:
                 if POI_FAMILY == "ictsmc" and poi["type"] not in ICT_SMC_POIS:
                     continue  # MSNR levels still count as confluence, but can't trigger on their own
-                # Hard filter: only high-grade ICT/SMC POIs may trigger (no plain FVG)
-                if poi["type"] not in HIGH_GRADE_POIS:
-                    continue
                 key = dedup_key(name, model, poi)
                 if key in self.state["fired_keys"]:
                     continue
@@ -1512,14 +1529,11 @@ class AlertEngine:
                         others = [p for p in pois if p is not poi]
                         checklist = build_checklist(setup, poi, others, flows, m1)
                         score = sum(1 for _, ok in checklist if ok)
-                        # Hard filter: multi-TF / stacked confluence must be true
+                        # Multi-TF / stacked confluence is preferred (sorting) but not mandatory
+                        # for Model 1 — with only Daily CRT it was blocking almost everything.
                         has_confluence = any(label.startswith("POI confluence") and ok for label, ok in checklist)
-                        if not has_confluence:
-                            log_change(f"noconf:{key}", "[%s] %s touch on %s suppressed: no multi-TF/stacked confluence",
-                                       name, model, poi["type"])
-                            break
                         if score >= MIN_CHECKLIST_SCORE:
-                            candidates.append((poi, m1, key, checklist, score))
+                            candidates.append((poi, m1, key, checklist, score, has_confluence, irl_erl.get("erl_swept", False)))
                         else:
                             log_change(f"low:{key}", "[%s] %s touch on %s suppressed: checklist %d/%d < MIN_CHECKLIST_SCORE=%d",
                                        name, model, poi["type"], score, len(checklist), MIN_CHECKLIST_SCORE)
@@ -1527,8 +1541,9 @@ class AlertEngine:
             if not candidates:
                 continue
             # Best first: highest-grade POI type, then highest checklist score.
-            candidates.sort(key=lambda t: (poi_priority(t[0]), -t[4]))
-            poi, m1, key, checklist, score = candidates[0]
+            # Prefer: higher-grade POI, then higher score, then confluence, then ERL swept
+            candidates.sort(key=lambda t: (poi_priority(t[0]), -t[4], not t[5], not t[6]))
+            poi, m1, key, checklist, score = candidates[0][:5]
 
             others = sorted((p for p in pois if p is not poi),
                             key=lambda p: abs(sum(poi_bounds(p)) / 2 - ref_close))[:5]
