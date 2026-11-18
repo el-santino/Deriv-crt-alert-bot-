@@ -174,10 +174,8 @@ def _choice(env_name: str, default: str, allowed: tuple) -> str:
 #    There is deliberately NO premium/discount rule.
 INVALIDATION_MODE = _choice("INVALIDATION_MODE", "candle1", ("candle1", "candle1_eq", "candle2"))
 DEALING_RANGE_MODE = _choice("DEALING_RANGE_MODE", "inside", ("inside", "overlap", "off"))
-# Alerts below this checklist score (out of 5) are suppressed.
-# High-grade POI + multi-TF confluence are now mandatory filters (see alert logic),
-# so the numeric threshold is set to 3.
-MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "3"))
+# Alerts below this checklist score are suppressed (checklist currently has 4 items).
+MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "2"))
 
 # POI families.
 # ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
@@ -197,7 +195,7 @@ POI_PRIORITY = {
     "ifvg": 4, "bpr": 5, "rejection_block": 6, "fvg": 7,
     "qmc": 8, "qml": 9, "v_level": 10, "a_level": 10,
 }
-# Kept for reference / future use only — no longer used as a filter or checklist item.
+# Kept for reference only — not used as a hard filter or checklist item.
 HIGH_GRADE_POIS = {"order_block", "propulsion_block", "breaker_block", "mitigation_block",
                    "ifvg", "bpr", "rejection_block"}
 
@@ -935,7 +933,7 @@ def build_checklist(setup: dict, poi: dict, other_pois: list[dict], flows: dict,
         and poi_bounds(o)[1] >= p_lo and poi_bounds(o)[0] <= p_hi
         for o in other_pois)
     reacted = (m1.close > p_hi) if d == "bullish" else (m1.close < p_lo)
-    # High-grade POI filter removed — FVG/BPR treated the same as other ICT/SMC POIs.
+    # High-grade filter removed — FVG/BPR treated the same as other ICT/SMC POIs.
     return [
         (f"All LTFs agree with the {d} bias ({'/'.join(flows.keys())})", all(f == d for f in flows.values())),
         ("POI formed inside candle 1's range", p_lo >= c1_low and p_hi <= c1_high),
@@ -1521,6 +1519,7 @@ class AlertEngine:
             for poi in pois:
                 if POI_FAMILY == "ictsmc" and poi["type"] not in ICT_SMC_POIS:
                     continue  # MSNR levels still count as confluence, but can't trigger on their own
+                # Plain FVG and BPR allowed (no high-grade hard filter)
                 key = dedup_key(name, model, poi)
                 if key in self.state["fired_keys"]:
                     continue
