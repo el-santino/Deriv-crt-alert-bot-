@@ -22,8 +22,8 @@ are first spotted early. Candle 1 is the dealing range (a POI must form inside i
 far extreme is the invalidation level: an LTF close beyond it kills the setup. Every alert
 carries a code-computed confluence checklist. Active setups are saved to STATE_PATH.
 Only ICT/SMC POIs trigger alerts by default (POI_FAMILY=ictsmc); MSNR levels still count
-as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=4 so only
-high-probability setups (4/5 or 5/5 checklist) are sent. POIs must form INSIDE candle 1's
+as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=3 so only
+high-probability setups (3/4 or 4/4 checklist) are sent. POIs must form INSIDE candle 1's
 range; there is no premium/discount rule.
 
 HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG, Order/
