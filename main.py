@@ -148,9 +148,9 @@ POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "40"))  # redu
 CANDLE_FETCH_COUNT = int(os.environ.get("CANDLE_FETCH_COUNT", "150"))
 # Minimum seconds between ANY two candle fetches, enforced globally (not per-symbol) —
 # this is what actually spreads out a cold-start burst across many symbols.
-CANDLE_FETCH_MIN_GAP = float(os.environ.get("CANDLE_FETCH_MIN_GAP", "0.6"))
-# Extra pause, shared by every symbol, the moment Deriv reports the expensive-call limit hit.
-CANDLE_FETCH_BACKOFF = int(os.environ.get("CANDLE_FETCH_BACKOFF", "15"))
+CANDLE_FETCH_MIN_GAP = float(os.environ.get("CANDLE_FETCH_MIN_GAP", "1.0"))
+# After a RateLimit hit, one shared cooldown is applied (not a cascade of pauses).
+CANDLE_FETCH_BACKOFF = int(os.environ.get("CANDLE_FETCH_BACKOFF", "30"))
 
 
 def _choice(env_name: str, default: str, allowed: tuple) -> str:
@@ -175,7 +175,7 @@ def _choice(env_name: str, default: str, allowed: tuple) -> str:
 INVALIDATION_MODE = _choice("INVALIDATION_MODE", "candle1", ("candle1", "candle1_eq", "candle2"))
 DEALING_RANGE_MODE = _choice("DEALING_RANGE_MODE", "inside", ("inside", "overlap", "off"))
 # Alerts below this checklist score are suppressed (checklist currently has 4 items).
-MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "2"))
+MIN_CHECKLIST_SCORE = int(os.environ.get("MIN_CHECKLIST_SCORE", "1"))
 
 # POI families.
 # ICT/SMC are the PRIMARY trigger POIs. MSNR levels (A/V, QML, QMC) are detected
@@ -238,6 +238,7 @@ class DerivClient:
         self._cache: dict[tuple, tuple] = {}  # (symbol, gran, count, drop_forming) -> (candles, fetched_at)
         self._candle_lock = asyncio.Lock()
         self._last_candle_call = 0.0
+        self._rate_limit_until = 0.0  # monotonic; shared cooldown after RateLimit
 
     async def connect(self):
         # ping_interval=None disables the low-level WebSocket protocol ping/pong.
@@ -324,6 +325,10 @@ class DerivClient:
         # that a cold start (37 symbols x several timeframes, no cache yet) spreads out
         # instead of bursting all at once.
         async with self._candle_lock:
+            # Honor existing shared RateLimit cooldown (one wait, not one per symbol).
+            now_m = time.monotonic()
+            if now_m < self._rate_limit_until:
+                await asyncio.sleep(self._rate_limit_until - now_m)
             wait = CANDLE_FETCH_MIN_GAP - (time.monotonic() - self._last_candle_call)
             if wait > 0:
                 await asyncio.sleep(wait)
@@ -339,9 +344,11 @@ class DerivClient:
                 })
             except RuntimeError as exc:
                 if "RateLimit" in str(exc):
-                    # Back off BEFORE releasing the lock, so every other symbol waiting on
-                    # this same lock is slowed down too, not just this one.
-                    log.warning("Hit Deriv's ticks_history rate limit — pausing %ds for ALL symbols", CANDLE_FETCH_BACKOFF)
+                    # Single shared cooldown — avoids a cascade of "pausing 15s" per symbol.
+                    self._rate_limit_until = time.monotonic() + CANDLE_FETCH_BACKOFF
+                    log.warning(
+                        "Hit Deriv ticks_history rate limit — shared cooldown %ds",
+                        CANDLE_FETCH_BACKOFF)
                     await asyncio.sleep(CANDLE_FETCH_BACKOFF)
                 self._last_candle_call = time.monotonic()
                 raise
