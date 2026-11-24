@@ -22,8 +22,8 @@ are first spotted early. Candle 1 is the dealing range (a POI must form inside i
 far extreme is the invalidation level: an LTF close beyond it kills the setup. Every alert
 carries a code-computed confluence checklist. Active setups are saved to STATE_PATH.
 Only ICT/SMC POIs trigger alerts by default (POI_FAMILY=ictsmc); MSNR levels still count
-as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=2 so only
-high-probability setups (2/4, 3/4 or 4/4 checklist) are sent. POIs must form INSIDE candle 1's
+as confluence only. Default ALERT_MODE=reaction and MIN_CHECKLIST_SCORE=4 so only
+high-probability setups (4/5 or 5/5 checklist) are sent. POIs must form INSIDE candle 1's
 range; there is no premium/discount rule.
 
 HONESTY NOTE: the detectors below (BOS, orderflow, FVG/IFVG, Order/
@@ -148,9 +148,10 @@ POI_LOOKBACK_CANDLES = int(os.environ.get("POI_LOOKBACK_CANDLES", "40"))  # redu
 CANDLE_FETCH_COUNT = int(os.environ.get("CANDLE_FETCH_COUNT", "150"))
 # Minimum seconds between ANY two candle fetches, enforced globally (not per-symbol) —
 # this is what actually spreads out a cold-start burst across many symbols.
-CANDLE_FETCH_MIN_GAP = float(os.environ.get("CANDLE_FETCH_MIN_GAP", "1.0"))
-# After a RateLimit hit, one shared cooldown is applied (not a cascade of pauses).
+CANDLE_FETCH_MIN_GAP = float(os.environ.get("CANDLE_FETCH_MIN_GAP", "2.0"))
+# Shared exponential cooldown after Deriv ticks_history rate-limit responses.
 CANDLE_FETCH_BACKOFF = int(os.environ.get("CANDLE_FETCH_BACKOFF", "30"))
+CANDLE_FETCH_BACKOFF_MAX = int(os.environ.get("CANDLE_FETCH_BACKOFF_MAX", "300"))
 
 
 def _choice(env_name: str, default: str, allowed: tuple) -> str:
@@ -239,6 +240,7 @@ class DerivClient:
         self._candle_lock = asyncio.Lock()
         self._last_candle_call = 0.0
         self._rate_limit_until = 0.0  # monotonic; shared cooldown after RateLimit
+        self._rate_limit_backoff = CANDLE_FETCH_BACKOFF
 
     async def connect(self):
         # ping_interval=None disables the low-level WebSocket protocol ping/pong.
@@ -308,7 +310,7 @@ class DerivClient:
                 # More aggressive cache: reuse confirmed candles until the *next*
                 # candle after the last one is due to close (plus small buffer).
                 # Higher TFs (H1/H2/H4/D1) benefit the most — far fewer API calls.
-                if candles and now < candles[-1].epoch + granularity + max(30, granularity * 0.05):
+                if candles and now < candles[-1].epoch + (2 * granularity) + max(30, granularity * 0.05):
                     return candles
             elif ttl is not None and now - fetched_at < ttl:
                 return candles
@@ -318,20 +320,16 @@ class DerivClient:
 
     async def get_candles(self, symbol: str, granularity: int, count: int = CANDLE_FETCH_COUNT,
                            drop_forming: bool = True) -> list[Candle]:
-        # Every candle fetch (this is Deriv's "expensive" ticks_history call) is paced through
-        # ONE shared lock, regardless of which symbol or model triggered it. A per-symbol
-        # backoff alone does not stop the NEXT symbol's request firing immediately after a
-        # RateLimit error — this closes that gap. CANDLE_FETCH_MIN_GAP is generous enough
-        # that a cold start (37 symbols x several timeframes, no cache yet) spreads out
-        # instead of bursting all at once.
+        # Pace every expensive ticks_history request through one shared lock.
         async with self._candle_lock:
-            # Honor existing shared RateLimit cooldown (one wait, not one per symbol).
             now_m = time.monotonic()
             if now_m < self._rate_limit_until:
                 await asyncio.sleep(self._rate_limit_until - now_m)
+
             wait = CANDLE_FETCH_MIN_GAP - (time.monotonic() - self._last_candle_call)
             if wait > 0:
                 await asyncio.sleep(wait)
+
             try:
                 resp = await self._send_recv({
                     "ticks_history": symbol,
@@ -343,16 +341,22 @@ class DerivClient:
                     "granularity": granularity,
                 })
             except RuntimeError as exc:
-                if "RateLimit" in str(exc):
-                    # Single shared cooldown — avoids a cascade of "pausing 15s" per symbol.
-                    self._rate_limit_until = time.monotonic() + CANDLE_FETCH_BACKOFF
-                    log.warning(
-                        "Hit Deriv ticks_history rate limit — shared cooldown %ds",
-                        CANDLE_FETCH_BACKOFF)
-                    await asyncio.sleep(CANDLE_FETCH_BACKOFF)
                 self._last_candle_call = time.monotonic()
+                if "RateLimit" in str(exc) or "rate" in str(exc).lower():
+                    delay = self._rate_limit_backoff
+                    self._rate_limit_until = time.monotonic() + delay
+                    self._rate_limit_backoff = min(
+                        max(CANDLE_FETCH_BACKOFF, delay * 2),
+                        CANDLE_FETCH_BACKOFF_MAX,
+                    )
+                    log.warning(
+                        "Deriv ticks_history rate limit; shared cooldown %ds (next backoff %ds)",
+                        delay, self._rate_limit_backoff,
+                    )
                 raise
             self._last_candle_call = time.monotonic()
+            self._rate_limit_backoff = CANDLE_FETCH_BACKOFF
+
         raw = resp.get("candles", [])
         candles = [Candle(epoch=c["epoch"], open=float(c["open"]), high=float(c["high"]),
                            low=float(c["low"]), close=float(c["close"])) for c in raw]
@@ -977,23 +981,25 @@ async def _detect_setup(client: DerivClient, name: str, symbol: str, model: str,
     gran = GRAN[bos_tf]
     label = "Model1" if model == "daily_crt" else "Model2"
 
+    # One raw read supplies both the forming-candle pair and the closed-candle pair.
+    # This avoids duplicate expensive ticks_history calls for the same symbol/timeframe.
+    raw_candles = await client.get_candles_cached(
+        symbol, gran, count=10, drop_forming=False, ttl=60
+    )
+    now = time.time()
+    closed = [c for c in raw_candles if c.epoch + gran <= now]
+
     pairs = []
-    if in_window:
-        # Early read: candle 2 is still forming (spec: evaluate before candle 2 closes).
-        forming = await client.get_candles_cached(symbol, gran, count=10, drop_forming=False, ttl=60)
-        if len(forming) >= 2:
-            pairs.append((forming[-2], forming[-1]))
-    # Always also consider the last two CLOSED candles: the setup stays live through
-    # the third candle (the current one), so this keeps it alive after the window ends
-    # and rebuilds it after a restart.
-    closed = await client.get_candles_cached(symbol, gran, count=10, drop_forming=True)
+    if in_window and len(raw_candles) >= 2:
+        forming = raw_candles[-1].epoch + gran > now
+        if forming:
+            pairs.append((raw_candles[-2], raw_candles[-1]))
     if len(closed) >= 2:
         pairs.append((closed[-2], closed[-1]))
 
-    now = time.time()
     for c1, c2 in pairs:
         if now >= c2.epoch + 2 * gran:
-            continue  # third candle already over
+            continue
         direction = two_candle_bos(c1, c2)
         setup_id = f"{name}|{model}|{c2.epoch}"
         if direction is None:
@@ -1406,8 +1412,6 @@ class AlertEngine:
                 setup = await check(self.client, name, symbol, known)
             except Exception as exc:  # noqa: BLE001
                 log.error("%s failed for %s: %s", check.__name__, name, exc)
-                if "RateLimit" in str(exc) or "rate" in str(exc).lower():
-                    await asyncio.sleep(10)
                 continue
             if setup:
                 self.state["active_setups"][setup["id"]] = setup
@@ -1515,7 +1519,7 @@ class AlertEngine:
 
             if m1s is None:
                 try:
-                    m1s = await self.client.get_candles(symbol, GRAN["M1"], count=3)
+                    m1s = await self.client.get_candles_cached(symbol, GRAN["M1"], count=3, drop_forming=True)
                 except Exception as exc:  # noqa: BLE001
                     log.error("[%s] Failed to fetch M1: %s", name, exc)
                     return
